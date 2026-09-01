@@ -1,0 +1,3 @@
+C:\Windows\system32>cd /d C:\Users\alex\gamebot\experiments\pcap
+
+C:\Users\alex\gamebot\experiments\pcap>C:\Users\alex\gamebot\venv\Scripts\python.exe probe.py --seconds 40 --tag maprelogin --local-ip 192.168.0.106 --filter "udp port 45879"  1>probe_maprelogin_log.txt 2>&1

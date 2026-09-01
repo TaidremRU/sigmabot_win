@@ -1,0 +1,24 @@
+# --- локальная конфигурация с секретами (шаблон: deploy/app/config.example.json) ---
+stage2/config.json
+config.json
+
+# --- рантайм-артефакты бота ---
+logs/
+**/logs/
+state.json
+*.lock
+supervisor.lock
+nav_cmd.txt
+nav_out.txt
+*.png
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- прочее ---
+.DS_Store
+*.swp

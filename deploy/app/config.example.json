@@ -1,0 +1,54 @@
+{
+  "_comment": "Скопируйте в config.json и заполните. Пути под свою VM, координаты — под разрешение окна игры.",
+
+  "steam_exe": "C:\\Program Files (x86)\\Steam\\Steam.exe",
+  "game_appid": 1690980,
+  "game_name": "Sigma World Online",
+  "game_exe": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Sigma World Online\\SigmaWorld.exe",
+  "game_install_dir": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Sigma World Online",
+
+  "base_dir": "C:\\Users\\USERNAME\\sigmabot",
+  "task_name": "SigmaSteamBot",
+  "poll_seconds": 30,
+  "initial_delay_seconds": 45,
+
+  "watchdog": {
+    "enabled": true,
+    "auto_start_steam": true,
+    "auto_start_game": true,
+    "auto_login": true,
+    "grace_after_launch_seconds": 150,
+    "max_restarts_per_hour": 8,
+    "login_settle_seconds": 40,
+    "login_retry_seconds": 120
+  },
+
+  "game_window_size": [1024, 768],
+  "login_flow": {
+    "_comment": "координаты ОТНОСИТЕЛЬНО окна игры при game_window_size; сверьте через nav.py shot",
+    "menu_steps": [
+      {"action": "click", "x": 866, "y": 496, "wait": 2.5, "tag": "game"},
+      {"action": "click", "x": 450, "y": 290, "wait": 2.5, "tag": "local"},
+      {"action": "ensure_check", "x": 226, "y": 364, "wait": 1.0, "tag": "steamlist"},
+      {"action": "click", "x": 301, "y": 513, "wait": 3.0, "tag": "play"}
+    ],
+    "ok": {"x": 511, "y": 525},
+    "await_menu_timeout": 60,
+    "await_login_timeout": 120,
+    "await_ingame_timeout": 150,
+    "_after_ingame_comment": "шаги ПОСЛЕ входа в мир (напр. открыть чат кликом по иконке в тулбаре); пусто = ничего",
+    "after_ingame": [
+      {"action": "click", "x": 547, "y": 702, "wait": 1.5, "tag": "openchat"}
+    ]
+  },
+
+  "telegram": {
+    "token": "PUT-BOTFATHER-TOKEN-HERE",
+    "allowed_user_ids": [123456789, 987654321],
+    "proxy": "socks5h://192.168.0.222:2080",
+    "poll_timeout": 50,
+    "alerts_enabled": true
+  },
+
+  "game_server_host": ""
+}
