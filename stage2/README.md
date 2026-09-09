@@ -18,12 +18,15 @@
 
 | Файл | Назначение |
 |---|---|
-| `config.json` | токен, allowlist, прокси, пути, параметры watchdog |
+| `config.json` | токен, роли (админы/модераторы/главный админ), язык, прокси, пути, параметры watchdog, `steam_api_dll` / `steam_web_api_key` / `monitor` |
 | `common.py` | конфиг, логи, `State`, клиент Telegram (обёртка над `curl.exe`) |
+| `i18n.py` | двуязычные строки бота (ru/en) + `t()` |
 | `sysinfo.py` | сбор ресурсов / состояния Steam / игры / сессий |
 | `gamectl.py` | запуск-останов Steam и игры, перезагрузка VM |
 | `watchdog.py` | цикл поддержания игры |
-| `bot.py` | команды и кнопки Telegram |
+| `bot.py` | команды и кнопки Telegram, фоновый монитор сервера |
+| `serverlist.py` | `fetch(cfg)` — список серверов: Steam-лобби, при ошибке Web API |
+| `serverlist_steam.py` | перечисление Steam-лобби через `steam_api64.dll` игры (`ctypes`), отдельный процесс |
 | `supervisor.py` | точка входа, single-instance lock |
 | `install.ps1` | автологон + энергосбережение + регистрация задачи |
 | `start.cmd` / `stop.cmd` | ручной запуск/останов |
@@ -37,31 +40,70 @@ Start-ScheduledTask -TaskName SigmaSteamBot
 
 После этого бот пришлёт в Telegram «🟢 SigmaSteamBot запущен» с текущим статусом.
 
+## Роли
+
+- **admin** — ID из `telegram.allowed_user_ids`: полный доступ.
+- **moderator** — ID из `telegram.moderator_user_ids`: только `/status`, `/shot`,
+  `/restartgame`, `/login`, `/lang`. Watchdog/Steam/VM/`/stopbot` недоступны, кнопки
+  этих действий не показываются. ID из обоих списков = админ.
+- **главный админ** — `telegram.super_admin_id` (по умолчанию первый из
+  `allowed_user_ids`): получает строку `👤 Имя (роль) → /команда` на каждое
+  действие другого админа/модератора, **меняющее состояние** (start/stop/restart
+  игры и Steam, `/login`, `/watchdog on|off`, подтверждённый ребут VM, `/stopbot`).
+  `/status`, `/shot`, `/lang` не логируются.
+
+Язык интерфейса — на пользователя (`/lang` или кнопка «🌐 Язык», значения `ru`/`en`),
+хранится в `state.json`; по умолчанию `telegram.default_lang`.
+
 ## Команды бота
 
-| Команда | Действие |
-|---|---|
-| `/status` | CPU/RAM/диск, аптайм, Steam (работает + вошёл ли в аккаунт), игра (PID, время, RAM, окно, «не отвечает»/свёрнуто), сессия/RDP, счётчики перезапусков |
-| `/shot` | скриншот экрана VM |
-| `/startgame` `/stopgame` `/restartgame` | управление игрой |
-| `/restartsteam` | перезапуск Steam |
-| `/restartvm` | перезагрузка VM (с кнопкой подтверждения) |
-| `/watchdog on\|off` | вкл/выкл авто-поддержание |
-| `/stopbot` | остановить скрипт: `schtasks /Change /TN SigmaSteamBot /DISABLE` + выход процесса (с подтверждением). Игра/Steam не трогаются. Обратно — только с VM: `Enable-ScheduledTask -TaskName SigmaSteamBot; Start-ScheduledTask -TaskName SigmaSteamBot` |
+| Команда | Роль | Действие |
+|---|---|---|
+| `/status` | админ, модератор | CPU/RAM/диск, аптайм, Steam (работает + вошёл ли в аккаунт), игра (PID, время, RAM, окно, «не отвечает»/свёрнуто), сессия/RDP, счётчики перезапусков |
+| `/shot` | админ, модератор | скриншот экрана VM |
+| `/servers` | админ | список публичных серверов (Steam-лобби): имя, игроки, карта, версия; **AstralSigma** — 👑 и наверху |
+| `/restartgame` | админ, модератор | перезапуск игры **+ сразу авто-вход в мир**, в конце скриншот |
+| `/login` | админ, модератор | пройти вход в игру вручную |
+| `/lang ru\|en` | админ, модератор | язык интерфейса |
+| `/startgame` `/stopgame` | админ | запуск / останов игры без входа |
+| `/restartsteam` | админ | перезапуск Steam |
+| `/restartvm` | админ | перезагрузка VM (с кнопкой подтверждения) |
+| `/watchdog on\|off` | админ | вкл/выкл авто-поддержание |
+| `/stopbot` | админ | остановить скрипт: `schtasks /Change /TN SigmaSteamBot /DISABLE` + выход процесса (с подтверждением). Игра/Steam не трогаются. Обратно — только с VM: `Enable-ScheduledTask -TaskName SigmaSteamBot; Start-ScheduledTask -TaskName SigmaSteamBot` |
 
 Те же действия продублированы инлайн-кнопками под каждым ответом.
-Доступ — только Telegram-ID из `allowed_user_ids`; остальным на `/start` бот
-отвечает их ID и больше ничего не делает.
+Доступ — только Telegram-ID из `allowed_user_ids` / `moderator_user_ids`; остальным
+на `/start` бот отвечает их ID и больше ничего не делает.
 
 **Поднять после `/stopbot`** (задача отключена, Telegram недоступен):
 двойной клик по ярлыку «Запустить SigmaSteamBot» на рабочем столе VM
 (скрипт `start-bot.cmd`), либо по SSH с Linux — `../deploy/start-bot.sh`,
 либо вручную `Enable-ScheduledTask -TaskName SigmaSteamBot; Start-ScheduledTask -TaskName SigmaSteamBot`.
 
+## Список серверов и монитор
+
+Sigma World Online не регистрирует game-серверы в мастер-листе Valve — публичный
+хост создаёт **Steam-лобби**. `/servers` и монитор берут список так:
+
+- `serverlist_steam.py` отдельным процессом грузит `steam_api64.dll` **игры**
+  (`config.json` → `steam_api_dll`) через `ctypes`, вызывает `SteamAPI_InitFlat`
+  → `RequestLobbyList` → `GetLobbyData` (`server_name`, `players`, `max_players`,
+  `build`). Нужна **консольная сессия** (там Steam) — супервизор в ней и работает.
+- Запасной слой — Steam Web API `GetServerList` (`config.json` → `steam_web_api_key`,
+  https://steamcommunity.com/dev/apikey). Пусто, пока игра не публикует game-серверы.
+
+**Фоновый монитор** (поток `srvmonitor`, `config.json` → `monitor`): первая
+проверка через ~90 c, дальше каждые `interval_seconds` (300). Нет `server_name`
+(`AstralSigma`) `misses_before_alert` (2) проверок подряд → рассылка **всем
+админам И модераторам** «⚠️ … пропал из списка серверов Steam»; повтор каждые
+`repeat_alert_seconds` (3600, `0` = один раз); вернулся → «✅ … снова в списке»
+один раз. Ошибка запроса списка — тик пропускается. Состояние (`monitor_astral`
+в `state.json`) переживает рестарт бота.
+
 ## Логи и состояние
 
 - `logs/supervisor.log` (ротация 5 МБ × 3)
-- `state.json` — счётчики + последний снапшот
+- `state.json` — счётчики + последний снапшот + `user_lang` + `monitor_astral`
 - `supervisor.lock` — PID работающего экземпляра
 
 ## Отключить

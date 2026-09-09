@@ -1,6 +1,9 @@
 # --- локальная конфигурация с секретами (шаблон: deploy/app/config.example.json) ---
 stage2/config.json
 config.json
+key.txt
+_lobbies_out.txt
+_exports.txt
 
 # --- рантайм-артефакты бота ---
 logs/

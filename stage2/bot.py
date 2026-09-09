@@ -1,5 +1,21 @@
 # -*- coding: utf-8 -*-
-"""Telegram-бот управления (long polling через SOCKS5-прокси)."""
+"""Telegram-бот управления (long polling через SOCKS5-прокси).
+
+Роли:
+  * **admin** — Telegram-ID из ``telegram.allowed_user_ids``; полный доступ.
+  * **moderator** — ID из ``telegram.moderator_user_ids``; только /status, /shot,
+    /restartgame (= перезапуск + вход), /login и /lang. Watchdog, Steam, VM и
+    остановка бота — недоступны.
+
+Главный админ (``telegram.super_admin_id``) получает уведомление о каждом
+действии другого админа/модератора, **меняющем состояние** (start/stop/restart
+игры и Steam, вход в игру, watchdog on|off, перезагрузка VM, /stopbot). Просмотр
+статуса, скриншоты и смена языка не логируются.
+
+Интерфейс двуязычный (ru/en). Язык — на пользователя, хранится в ``state.json``
+(``user_lang``), меняется командой /lang или кнопкой. По умолчанию —
+``telegram.default_lang``.
+"""
 import datetime
 import html
 import logging
@@ -10,72 +26,49 @@ import time
 
 import common
 import gamectl
+import i18n
 import screenshot
+import serverlist
 import sysinfo
 
+# команды и callback-действия, разрешённые роли moderator
+MOD_CMDS = {"start", "help", "menu", "status", "shot", "restartgame", "login", "lang"}
+MOD_ACTS = {"status", "shot", "game_restart", "login", "lang", "lang_ru", "lang_en"}
 
-def _fmt_bytes(n):
+# что уходит в аудит главному админу — только действия, меняющие состояние
+# (не /status, /shot, /lang, не открытие диалогов подтверждения и не отказы)
+AUDIT_CMDS = {"startgame", "stopgame", "restartgame", "restartsteam", "login", "watchdog"}
+AUDIT_ACTS = {"game_start", "game_stop", "game_restart", "steam_restart", "login",
+              "wd_toggle", "vm_yes", "bot_stop_yes"}
+
+
+def _fmt_bytes(n, lang="ru"):
     if n is None:
-        return "—"
+        return i18n.t(lang, "dash")
+    units = i18n.t(lang, "unit.bytes").split()
     n = float(n)
-    for u in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
-        if n < 1024:
-            return ("%.0f %s" % (n, u)) if u == "Б" else ("%.1f %s" % (n, u))
+    for i, u in enumerate(units):
+        if n < 1024 or i == len(units) - 1:
+            return ("%.0f %s" % (n, u)) if i == 0 else ("%.1f %s" % (n, u))
         n /= 1024
-    return "%.1f ПБ" % n
+    return "%.1f %s" % (n, units[-1])
 
 
-def _fmt_dur(s):
+def _fmt_dur(s, lang="ru"):
     if s is None:
-        return "—"
+        return i18n.t(lang, "dash")
+    d_, h_, m_, s_ = i18n.t(lang, "unit.dur").split()
     s = int(s)
     d, s = divmod(s, 86400)
     h, s = divmod(s, 3600)
     m, s = divmod(s, 60)
     if d:
-        return "%dд %dч %dм" % (d, h, m)
+        return "%d%s %d%s %d%s" % (d, d_, h, h_, m, m_)
     if h:
-        return "%dч %dм" % (h, m)
+        return "%d%s %d%s" % (h, h_, m, m_)
     if m:
-        return "%dм %dс" % (m, s)
-    return "%dс" % s
-
-
-MENU = {
-    "inline_keyboard": [
-        [{"text": "📊 Статус", "callback_data": "act:status"},
-         {"text": "📷 Скрин", "callback_data": "act:shot"}],
-        [{"text": "▶️ Запустить игру", "callback_data": "act:game_start"},
-         {"text": "⏹ Остановить игру", "callback_data": "act:game_stop"}],
-        [{"text": "🎮 Войти в игру", "callback_data": "act:login"},
-         {"text": "🔄 Перезапуск игры", "callback_data": "act:game_restart"}],
-        [{"text": "♻️ Перезапуск Steam", "callback_data": "act:steam_restart"}],
-        [{"text": "🐕 Watchdog вкл/выкл", "callback_data": "act:wd_toggle"},
-         {"text": "🖥 Перезагрузить VM", "callback_data": "act:vm_restart"}],
-        [{"text": "⛔ Остановить бота", "callback_data": "act:bot_stop"}],
-    ]
-}
-
-CONFIRM_VM = {
-    "inline_keyboard": [[
-        {"text": "✅ Да, перезагрузить", "callback_data": "act:vm_yes"},
-        {"text": "❌ Отмена", "callback_data": "act:vm_no"},
-    ]]
-}
-
-CONFIRM_STOP = {
-    "inline_keyboard": [[
-        {"text": "⛔ Да, остановить", "callback_data": "act:bot_stop_yes"},
-        {"text": "❌ Отмена", "callback_data": "act:bot_stop_no"},
-    ]]
-}
-
-STOP_PROMPT = (
-    "⛔ Остановить SigmaSteamBot?\n"
-    "Скрипт выключится и <b>сам не перезапустится</b> (ни авто-рестартом, ни при "
-    "перезагрузке VM). Игра и Steam останутся работать. Вернуть — только с VM "
-    "через SSH/RDP."
-)
+        return "%d%s %d%s" % (m, m_, s, s_)
+    return "%d%s" % (s, s_)
 
 
 class Bot:
@@ -84,45 +77,73 @@ class Bot:
         self.state = state
         self.wd = watchdog_ref
         tg = cfg["telegram"]
-        self.allowed = set(tg["allowed_user_ids"])
+        self._admins = set(tg.get("allowed_user_ids", []))
+        self._mods = set(tg.get("moderator_user_ids", [])) - self._admins
+        self.allowed = self._admins  # получатели широковещательных алертов
+        sa = tg.get("super_admin_id")
+        if not sa and tg.get("allowed_user_ids"):
+            sa = tg["allowed_user_ids"][0]
+        self._super_admin = sa
+        self._default_lang = i18n.norm(tg.get("default_lang", i18n.DEFAULT))
+        self._who = {}  # uid -> отображаемое имя (для аудита)
         self.tg = common.Telegram(tg["token"], tg["proxy"], tg.get("poll_timeout", 50))
         self.alerts_enabled = tg.get("alerts_enabled", True)
         self._offset = 0
         self._stop = threading.Event()
-        self._outbox = queue.Queue()  # алерты уходят сюда, шлёт отдельный поток
+        # (target, text): target=None -> всем админам; int -> конкретному uid
+        self._outbox = queue.Queue()
+
+        # фоновый монитор наличия сервера в списке Steam-лобби
+        mon = cfg.get("monitor", {}) or {}
+        self._mon_enabled = mon.get("enabled", True)
+        self._mon_name = mon.get("server_name", "AstralSigma")
+        self._mon_interval = max(60, int(mon.get("interval_seconds", 300)))
+        self._mon_misses_before = max(1, int(mon.get("misses_before_alert", 2)))
+        self._mon_repeat = int(mon.get("repeat_alert_seconds", 3600))  # 0 = без напоминаний
 
     # ---------- отправка из любого потока (НЕ блокирует вызывающего) ----------
     def push_alert(self, text):
         if self.alerts_enabled:
-            self._outbox.put(text)
+            self._outbox.put((None, text))
+
+    def _broadcast_roles(self, key, **kw):
+        """Разослать локализованное сообщение всем админам И модераторам."""
+        if not self.alerts_enabled:
+            return
+        for uid in (self._admins | self._mods):
+            self._outbox.put((uid, i18n.t(self._lang(uid), key, **kw)))
 
     def _sender_loop(self):
         while not self._stop.is_set():
             try:
-                text = self._outbox.get(timeout=1.0)
+                tgt, text = self._outbox.get(timeout=1.0)
             except queue.Empty:
                 continue
-            for uid in self.allowed:
+            uids = list(self.allowed) if tgt is None else [tgt]
+            for uid in uids:
                 try:
                     self.tg.send_message(uid, text)
                 except Exception:  # noqa: BLE001
-                    logging.exception("sender: не удалось отправить алерт")
+                    logging.exception("sender: не удалось отправить сообщение")
 
     def notify_startup(self):
         try:
             snap = sysinfo.collect(self.cfg, self.state)
         except Exception:  # noqa: BLE001
             snap = None
-        head = "🟢 <b>SigmaSteamBot запущен</b>"
+        lang = self._default_lang
+        head = i18n.t(lang, "alert.bot_started")
         if snap and snap["uptime_seconds"] < 300:
-            head = "✅ <b>VM снова в сети</b> (после перезагрузки)"
-        body = ("\n" + self._status_text(snap)) if snap else ""
+            head = i18n.t(lang, "alert.vm_back")
+        body = ("\n" + self._status_text(snap, lang)) if snap else ""
         self.push_alert(head + body)
 
     # ---------- основной цикл ----------
     def run(self):
         logging.info("bot: старт")
         threading.Thread(target=self._sender_loop, name="sender", daemon=True).start()
+        if self._mon_enabled:
+            threading.Thread(target=self._monitor_loop, name="srvmonitor", daemon=True).start()
         r = self.tg.get_updates(0, 0)
         if r.get("ok") and r.get("result"):
             self._offset = r["result"][-1]["update_id"] + 1
@@ -148,107 +169,236 @@ class Bot:
     def stop(self):
         self._stop.set()
 
-    # ---------- обработка ----------
-    def _auth(self, uid):
-        return uid in self.allowed
+    # ---------- роли / язык / аудит ----------
+    def _role(self, uid):
+        if uid in self._admins:
+            return "admin"
+        if uid in self._mods:
+            return "moderator"
+        return None
 
+    def _lang(self, uid):
+        try:
+            v = self.state.data.get("user_lang", {}).get(str(uid))
+        except Exception:  # noqa: BLE001
+            v = None
+        return i18n.norm(v or self._default_lang)
+
+    def _set_lang(self, uid, lang):
+        lang = i18n.norm(lang)
+        with self.state.lock:
+            self.state.data.setdefault("user_lang", {})[str(uid)] = lang
+        self.state.save()
+
+    def _set_lang_and_ack(self, chat, uid, newlang):
+        self._set_lang(uid, newlang)
+        role = self._role(uid)
+        self.tg.send_message(chat, i18n.t(newlang, "reply.lang_set"), self._menu(newlang, role))
+
+    def _remember(self, uid, frm):
+        if not uid:
+            return
+        name = (frm.get("first_name") or "").strip()
+        if frm.get("username"):
+            name = (name + " @" + frm["username"]).strip()
+        if name:
+            self._who[uid] = name
+
+    def _audit(self, uid, what):
+        """Копию действия другого админа/модератора — главному админу."""
+        sa = self._super_admin
+        if not sa or uid == sa:
+            return
+        lang = self._lang(sa)
+        role = i18n.t(lang, "role.%s" % (self._role(uid) or "moderator"))
+        who = self._who.get(uid) or ("id %s" % uid)
+        self._outbox.put(
+            (sa, i18n.t(lang, "audit.line", who=html.escape(str(who)), role=role, what=html.escape(what)))
+        )
+
+    # ---------- обработка ----------
     def _handle(self, upd):
         if "message" in upd:
             msg = upd["message"]
-            uid = msg.get("from", {}).get("id")
+            frm = msg.get("from", {}) or {}
+            uid = frm.get("id")
+            self._remember(uid, frm)
             text = (msg.get("text") or "").strip()
             chat = msg["chat"]["id"]
-            if not self._auth(uid):
+            role = self._role(uid)
+            if role is None:
                 if text.startswith("/start"):
-                    self.tg.send_message(
-                        chat,
-                        "Ваш Telegram ID: <code>%s</code>\nДоступ запрещён — добавьте ID в config.json." % uid,
-                    )
+                    self.tg.send_message(chat, i18n.t(self._default_lang, "reply.your_id", id=uid))
                 return
-            self._command(chat, text)
+            self._command(chat, text, uid, role)
         elif "callback_query" in upd:
             cq = upd["callback_query"]
-            uid = cq.get("from", {}).get("id")
+            frm = cq.get("from", {}) or {}
+            uid = frm.get("id")
+            self._remember(uid, frm)
             data = cq.get("data", "")
             chat = cq["message"]["chat"]["id"]
-            if not self._auth(uid):
-                self.tg.answer_callback(cq["id"], "Доступ запрещён")
+            role = self._role(uid)
+            act = data.split(":", 1)[1] if ":" in data else data
+            if role is None:
+                self.tg.answer_callback(cq["id"], i18n.t(self._default_lang, "reply.denied_cb"))
+                return
+            if role == "moderator" and act not in MOD_ACTS:
+                lang = self._lang(uid)
+                self.tg.answer_callback(cq["id"], i18n.t(lang, "reply.denied_cb"))
+                self.tg.send_message(chat, i18n.t(lang, "reply.denied_cmd"))
                 return
             self.tg.answer_callback(cq["id"])
-            self._action(chat, data.split(":", 1)[1] if ":" in data else data)
+            self._action(chat, act, uid, role)
 
-    def _command(self, chat, text):
+    def _command(self, chat, text, uid, role):
         parts = text.split()
         cmd = parts[0].lower().lstrip("/").split("@")[0] if parts else ""
         arg = parts[1].lower() if len(parts) > 1 else ""
+        lang = self._lang(uid)
+
+        if role == "moderator" and cmd and cmd not in MOD_CMDS:
+            self.tg.send_message(chat, i18n.t(lang, "reply.denied_cmd"), self._menu(lang, role))
+            return
+        if cmd in AUDIT_CMDS and not (cmd == "watchdog" and arg not in ("on", "off")):
+            self._audit(uid, text.strip()[:120])
+
         if cmd in ("start", "help", "menu"):
-            self.tg.send_message(chat, self._help_text(), MENU)
+            self.tg.send_message(chat, self._help_text(lang, role), self._menu(lang, role))
         elif cmd == "status":
-            self.tg.send_message(chat, self._status_text(), MENU)
+            self.tg.send_message(chat, self._status_text(lang=lang), self._menu(lang, role))
         elif cmd == "shot":
-            self._do_shot(chat)
+            self._do_shot(chat, lang)
+        elif cmd == "servers":
+            self._do_servers(chat, lang, role)
         elif cmd == "startgame":
-            self._async(chat, "▶️ Запускаю игру…", lambda: gamectl.start_game(self.cfg))
+            self._async(chat, i18n.t(lang, "wait.startgame"),
+                        lambda: self._tr(lang, gamectl.start_game(self.cfg)), lang=lang, role=role)
         elif cmd == "stopgame":
-            self._async(chat, "⏹ Останавливаю игру…", lambda: gamectl.stop_game(self.cfg))
+            self._async(chat, i18n.t(lang, "wait.stopgame"),
+                        lambda: self._tr(lang, gamectl.stop_game(self.cfg)), lang=lang, role=role)
         elif cmd == "restartgame":
-            self._async(chat, "🔄 Перезапускаю игру…", lambda: gamectl.restart_game(self.cfg))
+            self._async(chat, i18n.t(lang, "wait.restartgame"),
+                        lambda: self._do_restart_and_login(lang), shot_after=True, lang=lang, role=role)
         elif cmd == "restartsteam":
-            self._async(chat, "♻️ Перезапускаю Steam…", lambda: gamectl.restart_steam(self.cfg))
+            self._async(chat, i18n.t(lang, "wait.restartsteam"),
+                        lambda: self._tr(lang, gamectl.restart_steam(self.cfg)), lang=lang, role=role)
         elif cmd == "login":
-            self._async(chat, "🎮 Прохожу вход в игру…", self._do_login, shot_after=True)
+            self._async(chat, i18n.t(lang, "wait.login"),
+                        lambda: self._do_login(lang), shot_after=True, lang=lang, role=role)
         elif cmd == "restartvm":
-            self.tg.send_message(chat, "⚠️ Перезагрузить VM? Steam и игра будут закрыты.", CONFIRM_VM)
+            self.tg.send_message(chat, i18n.t(lang, "prompt.vm"), self._confirm_vm(lang))
         elif cmd in ("stopbot", "stop"):
-            self.tg.send_message(chat, STOP_PROMPT, CONFIRM_STOP)
+            self.tg.send_message(chat, i18n.t(lang, "prompt.stop"), self._confirm_stop(lang))
         elif cmd == "watchdog":
             if arg in ("on", "off") and self.wd:
                 self.wd.set_enabled(arg == "on")
-            st = "включён" if (self.wd and self.wd.enabled) else "выключен"
-            self.tg.send_message(chat, "🐕 Watchdog сейчас <b>%s</b>." % st, MENU)
+            st = i18n.t(lang, "wd.on") if (self.wd and self.wd.enabled) else i18n.t(lang, "wd.off")
+            self.tg.send_message(chat, i18n.t(lang, "wd.state", st=st), self._menu(lang, role))
+        elif cmd == "lang":
+            if arg in i18n.SUPPORTED:
+                self._set_lang_and_ack(chat, uid, arg)
+            else:
+                self.tg.send_message(chat, i18n.t(lang, "prompt.lang"), self._lang_kb(lang))
         else:
-            self.tg.send_message(chat, "Не понял. /help", MENU)
+            self.tg.send_message(chat, i18n.t(lang, "reply.not_understood"), self._menu(lang, role))
 
-    def _action(self, chat, act):
+    def _action(self, chat, act, uid, role):
+        lang = self._lang(uid)
+        if act in AUDIT_ACTS:
+            self._audit(uid, "act:" + act)
+
         if act == "status":
-            self.tg.send_message(chat, self._status_text(), MENU)
+            self.tg.send_message(chat, self._status_text(lang=lang), self._menu(lang, role))
         elif act == "shot":
-            self._do_shot(chat)
+            self._do_shot(chat, lang)
+        elif act == "servers":
+            self._do_servers(chat, lang, role)
         elif act == "game_start":
-            self._async(chat, "▶️ Запускаю игру…", lambda: gamectl.start_game(self.cfg))
+            self._async(chat, i18n.t(lang, "wait.startgame"),
+                        lambda: self._tr(lang, gamectl.start_game(self.cfg)), lang=lang, role=role)
         elif act == "game_stop":
-            self._async(chat, "⏹ Останавливаю игру…", lambda: gamectl.stop_game(self.cfg))
+            self._async(chat, i18n.t(lang, "wait.stopgame"),
+                        lambda: self._tr(lang, gamectl.stop_game(self.cfg)), lang=lang, role=role)
         elif act == "game_restart":
-            self._async(chat, "🔄 Перезапускаю игру…", lambda: gamectl.restart_game(self.cfg))
+            self._async(chat, i18n.t(lang, "wait.restartgame"),
+                        lambda: self._do_restart_and_login(lang), shot_after=True, lang=lang, role=role)
         elif act == "steam_restart":
-            self._async(chat, "♻️ Перезапускаю Steam…", lambda: gamectl.restart_steam(self.cfg))
+            self._async(chat, i18n.t(lang, "wait.restartsteam"),
+                        lambda: self._tr(lang, gamectl.restart_steam(self.cfg)), lang=lang, role=role)
         elif act == "login":
-            self._async(chat, "🎮 Прохожу вход в игру…", self._do_login, shot_after=True)
+            self._async(chat, i18n.t(lang, "wait.login"),
+                        lambda: self._do_login(lang), shot_after=True, lang=lang, role=role)
         elif act == "wd_toggle":
             if self.wd:
                 self.wd.set_enabled(not self.wd.enabled)
-                self.tg.send_message(
-                    chat,
-                    "🐕 Watchdog теперь <b>%s</b>." % ("включён" if self.wd.enabled else "выключен"),
-                    MENU,
-                )
+                st = i18n.t(lang, "wd.on") if self.wd.enabled else i18n.t(lang, "wd.off")
+                self.tg.send_message(chat, i18n.t(lang, "wd.toggled", st=st), self._menu(lang, role))
         elif act == "vm_restart":
-            self.tg.send_message(chat, "⚠️ Перезагрузить VM?", CONFIRM_VM)
+            self.tg.send_message(chat, i18n.t(lang, "prompt.vm"), self._confirm_vm(lang))
         elif act == "vm_yes":
-            self.push_alert("🖥 Перезагрузка VM по команде из Telegram…")
+            self.push_alert(i18n.t(self._default_lang, "wait.vm"))
             ok, msg = gamectl.restart_vm()
             if not ok:
-                self.tg.send_message(chat, "🔴 Не удалось: %s" % html.escape(str(msg)))
+                self.tg.send_message(chat, i18n.t(lang, "vm.fail", msg=html.escape(str(msg))))
         elif act == "vm_no":
-            self.tg.send_message(chat, "Отменено.", MENU)
+            self.tg.send_message(chat, i18n.t(lang, "reply.canceled"), self._menu(lang, role))
         elif act == "bot_stop":
-            self.tg.send_message(chat, STOP_PROMPT, CONFIRM_STOP)
+            self.tg.send_message(chat, i18n.t(lang, "prompt.stop"), self._confirm_stop(lang))
         elif act == "bot_stop_yes":
-            self._do_stop_bot(chat)
+            self._do_stop_bot(chat, lang)
         elif act == "bot_stop_no":
-            self.tg.send_message(chat, "Отменено.", MENU)
+            self.tg.send_message(chat, i18n.t(lang, "reply.canceled"), self._menu(lang, role))
+        elif act == "lang":
+            self.tg.send_message(chat, i18n.t(lang, "prompt.lang"), self._lang_kb(lang))
+        elif act == "lang_ru":
+            self._set_lang_and_ack(chat, uid, "ru")
+        elif act == "lang_en":
+            self._set_lang_and_ack(chat, uid, "en")
 
-    def _async(self, chat, wait_text, fn, shot_after=False):
+    # ---------- клавиатуры ----------
+    def _menu(self, lang, role):
+        def b(k, d):
+            return {"text": i18n.t(lang, k), "callback_data": d}
+
+        rows = [
+            [b("menu.status", "act:status"), b("menu.shot", "act:shot")],
+            [b("menu.login", "act:login"), b("menu.game_restart", "act:game_restart")],
+        ]
+        if role == "admin":
+            rows.append([b("menu.game_start", "act:game_start"), b("menu.game_stop", "act:game_stop")])
+            rows.append([b("menu.steam_restart", "act:steam_restart"), b("menu.servers", "act:servers")])
+            rows.append([b("menu.wd_toggle", "act:wd_toggle"), b("menu.vm_restart", "act:vm_restart")])
+            rows.append([b("menu.bot_stop", "act:bot_stop")])
+        rows.append([b("menu.lang", "act:lang")])
+        return {"inline_keyboard": rows}
+
+    def _confirm_vm(self, lang):
+        return {"inline_keyboard": [[
+            {"text": i18n.t(lang, "confirm.yes_vm"), "callback_data": "act:vm_yes"},
+            {"text": i18n.t(lang, "confirm.cancel"), "callback_data": "act:vm_no"},
+        ]]}
+
+    def _confirm_stop(self, lang):
+        return {"inline_keyboard": [[
+            {"text": i18n.t(lang, "confirm.yes_stop"), "callback_data": "act:bot_stop_yes"},
+            {"text": i18n.t(lang, "confirm.cancel"), "callback_data": "act:bot_stop_no"},
+        ]]}
+
+    def _lang_kb(self, lang):
+        return {"inline_keyboard": [[
+            {"text": i18n.t(lang, "lang.ru"), "callback_data": "act:lang_ru"},
+            {"text": i18n.t(lang, "lang.en"), "callback_data": "act:lang_en"},
+        ]]}
+
+    # ---------- действия ----------
+    def _tr(self, lang, res):
+        """(ok, key, params) от gamectl -> (ok, локализованная строка)."""
+        ok, key, params = res
+        return ok, i18n.t(lang, key, **(params or {}))
+
+    def _async(self, chat, wait_text, fn, shot_after=False, lang=None, role="admin"):
+        lang = i18n.norm(lang or self._default_lang)
         self.tg.send_message(chat, wait_text)
 
         def worker():
@@ -256,54 +406,54 @@ class Bot:
                 ok, msg = fn()
                 self.tg.send_message(
                     chat,
-                    ("✅ " if ok else "🔴 ") + html.escape(str(msg)) + "\n\n" + self._status_text(),
-                    MENU,
+                    ("✅ " if ok else "🔴 ") + str(msg) + "\n\n" + self._status_text(lang=lang),
+                    self._menu(lang, role),
                 )
                 if shot_after:
-                    self._do_shot(chat)
+                    self._do_shot(chat, lang)
             except Exception as e:  # noqa: BLE001
                 logging.exception("action error")
-                self.tg.send_message(chat, "🔴 Ошибка: %s" % html.escape(str(e)))
+                self.tg.send_message(chat, "🔴 " + html.escape(str(e)))
 
         threading.Thread(target=worker, name="action", daemon=True).start()
 
-    def _do_login(self):
+    def _do_login(self, lang):
         try:
             import runner
 
             ok, out = runner.run_nav("seq login", timeout=280)
         except Exception as e:  # noqa: BLE001
             logging.exception("login sequence error")
-            return False, "ошибка последовательности: %s" % e
+            return False, i18n.t(lang, "login.seq_error", err=e)
         tail = [ln for ln in out.strip().splitlines() if ln.strip()][-3:]
         suffix = ("\n<code>%s</code>" % html.escape("\n".join(tail))) if tail else ""
-        return ok, ("вошёл в игру" if ok else "последовательность не довершена") + suffix
+        return ok, i18n.t(lang, "login.done" if ok else "login.failed") + suffix
 
-    def _do_stop_bot(self, chat):
+    def _do_restart_and_login(self, lang):
+        """Перезапустить игру и сразу пройти вход в мир (для admin и moderator)."""
+        ok, key, params = gamectl.restart_game(self.cfg)
+        if not ok:
+            return False, i18n.t(lang, "restartlogin.restart_failed",
+                                 msg=i18n.t(lang, key, **(params or {})))
+        lok, lmsg = self._do_login(lang)
+        if lok:
+            return True, i18n.t(lang, "restartlogin.done")
+        return False, i18n.t(lang, "restartlogin.login_failed") + (("\n" + lmsg) if lmsg else "")
+
+    def _do_stop_bot(self, chat, lang):
         """Отключить задачу планировщика и завершить супервизор.
 
         Выполняется прямо в цикле опроса, поэтому сообщения шлём синхронно (через
         _outbox не успеют уйти до выхода процесса).
         """
-        self.tg.send_message(chat, "⛔ Останавливаю бота…")
+        self.tg.send_message(chat, i18n.t(lang, "wait.botstop"))
         task = self.cfg.get("task_name", "SigmaSteamBot")
         ok, msg = gamectl.disable_bot_task(task)
         logging.info("bot: /stopbot из Telegram, disable %s ok=%s (%s)", task, ok, msg)
         if ok:
-            txt = (
-                "🛑 <b>SigmaSteamBot остановлен.</b>\n"
-                "Задача <code>%s</code> отключена — авто-рестарта не будет.\n\n"
-                "Запуск снова (на VM):\n"
-                "<code>Enable-ScheduledTask -TaskName %s; Start-ScheduledTask -TaskName %s</code>"
-                % (task, task, task)
-            )
+            txt = i18n.t(lang, "botstop.ok", task=task)
         else:
-            txt = (
-                "⚠️ Процесс завершаю, но задачу <code>%s</code> отключить не вышло:\n"
-                "<code>%s</code>\n"
-                "Планировщик поднимет бота снова в течение ~2 минут — отключите задачу вручную."
-                % (task, html.escape(str(msg)))
-            )
+            txt = i18n.t(lang, "botstop.fail", task=task, msg=html.escape(str(msg)))
         self.tg.send_message(chat, txt)
         if self.wd:
             try:
@@ -312,7 +462,7 @@ class Bot:
                 logging.exception("stop: не удалось остановить watchdog")
         self.stop()
 
-    def _do_shot(self, chat):
+    def _do_shot(self, chat, lang):
         path = os.path.join(self.cfg["base_dir"], "logs", "shot.png")
         hwnd = None
         try:
@@ -325,98 +475,182 @@ class Bot:
             method, size = screenshot.capture(path, hwnd)
         except Exception as e:  # noqa: BLE001
             logging.exception("shot: захват не удался")
-            self.tg.send_message(chat, "🔴 Не удалось снять экран:\n<code>%s</code>" % html.escape(str(e)))
+            self.tg.send_message(chat, i18n.t(lang, "shot.capture_failed", err=html.escape(str(e))))
             return
-        cap = "Экран VM • %s • %sx%s • %s" % (
-            method, size[0], size[1], datetime.datetime.now().strftime("%H:%M:%S"),
-        )
+        cap = i18n.t(lang, "shot.caption", method=method, w=size[0], h=size[1],
+                     ts=datetime.datetime.now().strftime("%H:%M:%S"))
         r = self.tg.send_photo(chat, path, cap)
         if not r.get("ok"):
             self.tg.send_message(
-                chat, "🔴 Отправка не удалась: %s" % html.escape(str(r.get("error") or r.get("description")))
+                chat,
+                i18n.t(lang, "shot.send_failed",
+                       err=html.escape(str(r.get("error") or r.get("description")))),
             )
 
-    def _help_text(self):
-        return (
-            "<b>SigmaSteamBot</b> — управление игрой Sigma World Online на VM\n\n"
-            "/status — состояние VM, Steam и игры\n"
-            "/shot — скриншот экрана\n"
-            "/startgame · /stopgame · /restartgame\n"
-            "/login — пройти вход в игру (Game→Local→Steam→Play→Ok)\n"
-            "/restartsteam — перезапуск Steam\n"
-            "/restartvm — перезагрузка VM (с подтверждением)\n"
-            "/watchdog on|off — авто-поддержание игры\n"
-            "/stopbot — остановить сам скрипт (с подтверждением; запуск обратно — только с VM)\n\n"
-            "Ниже — кнопки для того же самого."
-        )
+    # ---------- список игровых серверов ----------
+    _HL_SERVER = "astralsigma"  # какой сервер подсвечивать в списке
 
-    def _status_text(self, snap=None):
+    def _do_servers(self, chat, lang, role):
+        self.tg.send_message(chat, i18n.t(lang, "wait.servers"))
+
+        def worker():
+            try:
+                txt = self._servers_text(lang)
+            except Exception as e:  # noqa: BLE001
+                logging.exception("servers error")
+                txt = i18n.t(lang, "servers.fail", err=html.escape(str(e)))
+            self.tg.send_message(chat, txt, self._menu(lang, role))
+
+        threading.Thread(target=worker, name="servers", daemon=True).start()
+
+    def _servers_text(self, lang):
+        ok, res, src = serverlist.fetch(self.cfg)
+        if not ok:
+            return i18n.t(lang, "servers.fail", err=html.escape(str(res)))
+        if not res:
+            return i18n.t(lang, "servers.none")
+
+        def is_hl(s):
+            return self._HL_SERVER in (s.get("name") or "").lower().replace(" ", "")
+
+        res.sort(key=lambda s: (not is_hl(s), -(s.get("players") or 0), (s.get("name") or "").lower()))
+        shown = res[:40]
+        lines = [i18n.t(lang, "servers.head", n=len(res))]
+        for s in shown:
+            name = html.escape(s.get("name") or "?")
+            pl, mx = s.get("players") or 0, s.get("max_players") or 0
+            extra = ""
+            if s.get("map"):
+                extra += " • " + html.escape(str(s["map"]))
+            if s.get("version"):
+                extra += " • v" + html.escape(str(s["version"]))
+            head = ("👑 <b>%s</b>" % name) if is_hl(s) else ("• %s" % name)
+            lines.append("%s — %d/%d" % (head, pl, mx))
+            lines.append("    <code>%s</code>%s" % (html.escape(s.get("addr") or "?"), extra))
+        if len(res) > len(shown):
+            lines.append(i18n.t(lang, "servers.more", n=len(res) - len(shown)))
+        if src == "webapi":
+            lines.append(i18n.t(lang, "servers.via_webapi"))
+        return "\n".join(lines)
+
+    # ---------- фоновый монитор наличия сервера в списке ----------
+    def _monitor_loop(self):
+        target = self._mon_name.lower().replace(" ", "")
+        # первая проверка — не сразу на старте (дать Steam/игре подняться)
+        if self._stop.wait(min(self._mon_interval, 90)):
+            return
+        while not self._stop.is_set():
+            try:
+                self._monitor_check(target)
+            except Exception:  # noqa: BLE001
+                logging.exception("srvmonitor: ошибка проверки")
+            if self._stop.wait(self._mon_interval):
+                return
+
+    def _monitor_check(self, target):
+        ok, res, src = serverlist.fetch(self.cfg)
+        if not ok:
+            logging.warning("srvmonitor: список серверов недоступен (%s) — пропускаю тик", res)
+            return
+        present = any(target in (s.get("name") or "").lower().replace(" ", "") for s in res)
+
+        st = self.state.data.get("monitor_astral") or {}
+        alerted = bool(st.get("alerted"))
+        misses = int(st.get("misses") or 0)
+        last_alert = float(st.get("last_alert_ts") or 0)
+        now = time.time()
+
+        if present:
+            if alerted:
+                self._broadcast_roles("monitor.astral_back", name=self._mon_name)
+                logging.info("srvmonitor: %s снова в списке", self._mon_name)
+            new_st = {"present": True, "misses": 0, "alerted": False, "last_alert_ts": 0}
+        else:
+            misses += 1
+            fire = (not alerted and misses >= self._mon_misses_before) or (
+                alerted and self._mon_repeat and now - last_alert >= self._mon_repeat
+            )
+            if fire:
+                self._broadcast_roles("monitor.astral_missing", name=self._mon_name, n=misses)
+                logging.warning("srvmonitor: %s НЕ в списке (проверок подряд: %d, src=%s)",
+                                self._mon_name, misses, src)
+                alerted, last_alert = True, now
+            new_st = {"present": False, "misses": misses,
+                      "alerted": alerted, "last_alert_ts": last_alert}
+
+        with self.state.lock:
+            self.state.data["monitor_astral"] = new_st
+        self.state.save()
+
+    def _help_text(self, lang, role):
+        return i18n.t(lang, "help.mod" if role == "moderator" else "help.admin")
+
+    def _status_text(self, snap=None, lang=None):
+        lang = i18n.norm(lang or self._default_lang)
+
+        def T(k, **kw):
+            return i18n.t(lang, k, **kw)
+
         if snap is None:
             try:
                 snap = sysinfo.collect(self.cfg, self.state)
             except Exception as e:  # noqa: BLE001
-                return "🔴 Не удалось собрать статус: %s" % html.escape(str(e))
+                return T("status.collect_failed", err=html.escape(str(e)))
         g = snap["game"]
         s = snap["steam"]
         out = []
-        out.append("🖥 <b>VM</b> • аптайм %s" % _fmt_dur(snap["uptime_seconds"]))
-        out.append(
-            "   CPU %.0f%% (%s ядер) • RAM %.0f%% (%s / %s) • C: своб. %s (%.0f%% занято)"
-            % (
-                snap["cpu_percent"], snap["cpu_count"] or "?", snap["mem"]["percent"],
-                _fmt_bytes(snap["mem"]["used"]), _fmt_bytes(snap["mem"]["total"]),
-                _fmt_bytes(snap["disk_c"]["free"]), snap["disk_c"]["percent"],
-            )
-        )
+        out.append(T("status.vm", up=_fmt_dur(snap["uptime_seconds"], lang)))
+        out.append(T(
+            "status.res",
+            cpu="%.0f" % snap["cpu_percent"], cores=snap["cpu_count"] or "?",
+            memp="%.0f" % snap["mem"]["percent"],
+            memu=_fmt_bytes(snap["mem"]["used"], lang), memt=_fmt_bytes(snap["mem"]["total"], lang),
+            cfree=_fmt_bytes(snap["disk_c"]["free"], lang), cusedp="%.0f" % snap["disk_c"]["percent"],
+        ))
         sess = (
-            "RDP подключён" if snap["rdp_connected"]
-            else ("консоль активна" if snap["console_active"] else "нет активной сессии")
+            T("status.sess_rdp") if snap["rdp_connected"]
+            else (T("status.sess_console") if snap["console_active"] else T("status.sess_none"))
         )
-        out.append("   Сессия: %s" % sess)
+        out.append(T("status.sess", sess=sess))
 
-        li = {True: "вошёл в аккаунт", False: "НЕ вошёл", None: "?"}[s["logged_in"]]
-        out.append(
-            "\n🎮 <b>Steam</b>: %s • %s • %s"
-            % (
-                "🟢 работает" if s["running"] else "🔴 не запущен",
-                html.escape(s["account"] or "?"),
-                li,
-            )
-        )
+        li = {True: T("status.li_yes"), False: T("status.li_no"), None: T("status.li_unknown")}[s["logged_in"]]
+        out.append(T(
+            "status.steam",
+            run=T("status.steam_up") if s["running"] else T("status.steam_down"),
+            acc=html.escape(s["account"] or "?"), li=li,
+        ))
 
         if g["running"]:
-            ls = {"done": "в игре ✅", "running": "вход выполняется…", "idle": "в меню"}.get(
-                self.state.data.get("login_state"), "?"
-            )
-            out.append(
-                "🕹 <b>Игра</b>: 🟢 работает • %s • PID %s • %s • RAM %s • CPU %.0f%%"
-                % (ls, g.get("pid"), _fmt_dur(g.get("run_seconds")), _fmt_bytes(g.get("rss")), g.get("cpu") or 0)
-            )
+            ls = {
+                "done": T("status.ls_done"), "running": T("status.ls_running"), "idle": T("status.ls_idle"),
+            }.get(self.state.data.get("login_state"), T("status.ls_unknown"))
+            out.append(T(
+                "status.game_up",
+                ls=ls, pid=g.get("pid"), dur=_fmt_dur(g.get("run_seconds"), lang),
+                ram=_fmt_bytes(g.get("rss"), lang), cpu="%.0f" % (g.get("cpu") or 0),
+            ))
             extra = []
             if g.get("window_title"):
-                extra.append("окно: «%s»" % html.escape(g["window_title"]))
+                extra.append(T("status.win", title=html.escape(g["window_title"])))
             if g.get("minimized"):
-                extra.append("свёрнуто")
+                extra.append(T("status.minimized"))
             if g.get("responding") is False:
-                extra.append("⚠️ не отвечает")
+                extra.append(T("status.noresp"))
             if extra:
                 out.append("   " + " • ".join(extra))
         else:
-            out.append("🕹 <b>Игра</b>: 🔴 не запущена")
+            out.append(T("status.game_down"))
 
         c = snap.get("counters", {})
         wd_on = self.wd.enabled if self.wd else c.get("watchdog_enabled")
-        out.append(
-            "\n🐕 Watchdog: %s • перезапусков с загрузки: игра %s / Steam %s"
-            % (
-                "вкл" if wd_on else "выкл",
-                c.get("game_restarts", 0),
-                c.get("steam_restarts", 0),
-            )
-        )
+        out.append(T(
+            "status.wd",
+            on=T("status.wd_on") if wd_on else T("status.wd_off"),
+            g=c.get("game_restarts", 0), s=c.get("steam_restarts", 0),
+        ))
         if c.get("last_restart_ts"):
-            out.append(
-                "   последний перезапуск: %s"
-                % datetime.datetime.fromtimestamp(c["last_restart_ts"]).strftime("%d.%m %H:%M:%S")
-            )
+            out.append(T(
+                "status.last_restart",
+                ts=datetime.datetime.fromtimestamp(c["last_restart_ts"]).strftime("%d.%m %H:%M:%S"),
+            ))
         return "\n".join(out)

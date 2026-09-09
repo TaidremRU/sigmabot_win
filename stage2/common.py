@@ -64,6 +64,7 @@ class State:
             "watchdog_enabled": None,
             "boot_id": None,
             "last_snapshot": {},
+            "user_lang": {},
         }
         self.load()
 

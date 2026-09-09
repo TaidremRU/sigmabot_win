@@ -1,5 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Управление Steam и игрой Sigma World Online."""
+"""Управление Steam и игрой Sigma World Online.
+
+Функции жизненного цикла Steam/игры возвращают тройку ``(ok, msg_key, params)``:
+``msg_key`` — ключ i18n (``gc.*``), ``params`` — словарь подстановок (может быть
+пустым). Перевод делает вызывающий (bot по языку пользователя, watchdog по
+языку по умолчанию). ``restart_vm`` и ``disable_bot_task`` возвращают
+``(ok, text)`` с сырым системным выводом — переводить там нечего.
+"""
 import logging
 import os
 import subprocess
@@ -33,35 +40,35 @@ def game_running(cfg):
 
 def start_steam(cfg, wait=25):
     if steam_running():
-        return True, "Steam уже запущен"
+        return True, "gc.steam_already_running", {}
     subprocess.Popen([cfg["steam_exe"], "-silent"], close_fds=True)
     for _ in range(wait):
         time.sleep(1)
         if steam_running():
-            return True, "Steam запущен"
-    return False, "Steam не поднялся за %d с" % wait
+            return True, "gc.steam_started", {}
+    return False, "gc.steam_timeout", {"sec": wait}
 
 
 def stop_steam(cfg, wait=25):
     if not steam_running():
-        return True, "Steam уже остановлен"
+        return True, "gc.steam_already_stopped", {}
     _run([cfg["steam_exe"], "-shutdown"], timeout=10)
     for _ in range(wait):
         time.sleep(1)
         if not steam_running():
-            return True, "Steam остановлен"
+            return True, "gc.steam_stopped", {}
     _run(["taskkill", "/F", "/T", "/IM", "steam.exe"])
     time.sleep(2)
-    return (not steam_running()), "Steam убит принудительно"
+    return (not steam_running()), "gc.steam_killed", {}
 
 
 def start_game(cfg, ensure_steam=True, wait=60):
     if game_running(cfg):
-        return True, "Игра уже запущена"
+        return True, "gc.game_already_running", {}
     if ensure_steam and not steam_running():
-        ok, msg = start_steam(cfg)
+        ok, key, params = start_steam(cfg)
         if not ok:
-            return False, "Не удалось запустить Steam: " + msg
+            return False, key, params
         time.sleep(8)
     url = "steam://rungameid/%d" % cfg["game_appid"]
     try:
@@ -71,17 +78,17 @@ def start_game(cfg, ensure_steam=True, wait=60):
     for _ in range(wait):
         time.sleep(1)
         if game_running(cfg):
-            return True, "Игра запущена"
-    return False, "Игра не появилась за %d с" % wait
+            return True, "gc.game_started", {}
+    return False, "gc.game_timeout", {"sec": wait}
 
 
 def stop_game(cfg):
     if not game_running(cfg):
-        return True, "Игра уже закрыта"
+        return True, "gc.game_already_stopped", {}
     _run(["taskkill", "/F", "/IM", "SigmaWorld.exe"])
     _run(["taskkill", "/F", "/IM", "UnityCrashHandler64.exe"])
     time.sleep(2)
-    return (not game_running(cfg)), "Игра закрыта"
+    return (not game_running(cfg)), "gc.game_stopped", {}
 
 
 def restart_game(cfg):
@@ -93,8 +100,10 @@ def restart_game(cfg):
 def restart_steam(cfg):
     stop_steam(cfg)
     time.sleep(3)
-    ok, msg = start_steam(cfg)
-    return ok, ("Steam перезапущен" if ok else msg)
+    ok, key, params = start_steam(cfg)
+    if ok:
+        return True, "gc.steam_restarted", {}
+    return False, key, params
 
 
 def restart_vm(reason="SigmaSteamBot restart"):

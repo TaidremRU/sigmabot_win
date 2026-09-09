@@ -12,6 +12,20 @@
   "poll_seconds": 30,
   "initial_delay_seconds": 45,
 
+  "_serverlist_comment": "Кнопка «Серверы» у админов. Основной источник — Steam-лобби (serverlist_steam.py грузит steam_api64.dll игры). steam_web_api_key — запасной путь (GetServerList) на случай, если игра начнёт публиковать game-серверы.",
+  "steam_api_dll": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Sigma World Online\\SigmaWorld_Data\\Plugins\\x86_64\\steam_api64.dll",
+  "steam_web_api_key": "",
+  "python_exe": "",
+
+  "_monitor_comment": "Фоновая проверка: есть ли server_name в списке публичных Steam-лобби. Нет N проверок подряд -> уведомление всем админам И модераторам; повтор каждые repeat_alert_seconds (0 = один раз); возврат -> сообщение «снова в списке».",
+  "monitor": {
+    "enabled": true,
+    "server_name": "AstralSigma",
+    "interval_seconds": 300,
+    "misses_before_alert": 2,
+    "repeat_alert_seconds": 3600
+  },
+
   "watchdog": {
     "enabled": true,
     "auto_start_steam": true,
@@ -44,7 +58,13 @@
 
   "telegram": {
     "token": "PUT-BOTFATHER-TOKEN-HERE",
+    "_ids_comment": "allowed_user_ids = админы (полный доступ). moderator_user_ids = модераторы: только /status, /shot, /restartgame, /login, /lang. ID из обоих списков считается админом.",
     "allowed_user_ids": [123456789, 987654321],
+    "moderator_user_ids": [],
+    "super_admin_id": 123456789,
+    "_super_admin_comment": "получает копию каждой команды/кнопки других админов и модераторов; пусто -> берётся первый из allowed_user_ids",
+    "default_lang": "ru",
+    "_lang_comment": "язык по умолчанию (ru|en); каждый пользователь может сменить командой /lang",
     "proxy": "socks5h://192.168.0.222:2080",
     "poll_timeout": 50,
     "alerts_enabled": true

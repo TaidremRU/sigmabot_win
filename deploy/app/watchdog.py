@@ -6,6 +6,7 @@ import time
 from collections import deque
 
 import gamectl
+import i18n
 import sysinfo
 
 
@@ -15,6 +16,8 @@ class Watchdog(threading.Thread):
         self.cfg = cfg
         self.state = state
         self.alert = alert  # callable(text)
+        # алерты watchdog идут всем админам сразу — язык по умолчанию из конфига
+        self._alang = i18n.norm(cfg.get("telegram", {}).get("default_lang", i18n.DEFAULT))
 
         wd = cfg.get("watchdog", {})
         self.enabled = state.data.get("watchdog_enabled")
@@ -81,13 +84,18 @@ class Watchdog(threading.Thread):
                 logging.exception("watchdog tick error")
             self._stop.wait(self.poll)
 
+    def _t(self, key, **kw):
+        return i18n.t(self._alang, key, **kw)
+
+    def _gc(self, res):
+        """(ok, key, params) от gamectl -> (ok, локализованная строка)."""
+        ok, key, params = res
+        return ok, i18n.t(self._alang, key, **(params or {}))
+
     def _limit_msg(self):
         if not self._limit_warned:
             self._limit_warned = True
-            self.alert(
-                "🛑 Достигнут лимит перезапусков (%d/час). Авто-действия приостановлены."
-                % self.max_per_hour
-            )
+            self.alert(self._t("wd_alert.limit", n=self.max_per_hour))
 
     def _game_pid(self):
         pids = [p.pid for p in sysinfo.find_procs(["sigmaworld.exe"], self.cfg.get("game_install_dir"))]
@@ -108,29 +116,29 @@ class Watchdog(threading.Thread):
             self._game_up_since = time.time() if pid else 0.0
 
         if self._prev_steam is True and not steam_up:
-            self.alert("❌ Steam завершился.")
+            self.alert(self._t("wd_alert.steam_exited"))
         if self._prev_game is True and not game_up:
-            self.alert("❌ Игра <b>%s</b> закрылась." % cfg["game_name"])
+            self.alert(self._t("wd_alert.game_closed", name=cfg["game_name"]))
 
         if self.enabled:
             within_grace = (time.time() - self._last_launch) < self.grace
             if self.auto_steam and not steam_up:
                 if self._rate_ok():
-                    self.alert("⚠️ Steam не запущен — поднимаю…")
-                    ok, msg = gamectl.start_steam(cfg)
+                    self.alert(self._t("wd_alert.steam_down_starting"))
+                    ok, msg = self._gc(gamectl.start_steam(cfg))
                     self._last_launch = time.time()
                     self._mark_restart("steam")
-                    self.alert(("✅ " if ok else "🔴 ") + msg)
+                    self.alert(self._t("wd_alert.result_ok" if ok else "wd_alert.result_fail", msg=msg))
                     steam_up = ok
                 else:
                     self._limit_msg()
             elif steam_up and self.auto_game and not game_up and not within_grace:
                 if self._rate_ok():
-                    self.alert("⚠️ Игра не запущена — запускаю…")
-                    ok, msg = gamectl.start_game(cfg)
+                    self.alert(self._t("wd_alert.game_down_starting"))
+                    ok, msg = self._gc(gamectl.start_game(cfg))
                     self._last_launch = time.time()
                     self._mark_restart("game")
-                    self.alert(("✅ " if ok else "🔴 ") + msg)
+                    self.alert(self._t("wd_alert.result_ok" if ok else "wd_alert.result_fail", msg=msg))
                     game_up = ok
                 else:
                     self._limit_msg()
@@ -175,10 +183,10 @@ class Watchdog(threading.Thread):
                 ok = False
             if ok:
                 self._login_state = "done"
-                self.alert("🎮 Автовход в игру выполнен.")
+                self.alert(self._t("wd_alert.login_ok"))
             else:
                 self._login_state = "idle"
                 self._login_next = time.time() + self.login_retry
-                self.alert("⚠️ Автовход не удался — повтор через %d c." % self.login_retry)
+                self.alert(self._t("wd_alert.login_retry", sec=self.login_retry))
 
         threading.Thread(target=work, name="autologin", daemon=True).start()
