@@ -20,6 +20,7 @@
 |---|---|
 | **watchdog** | следит, что Steam и игра запущены; поднимает упавшее; после старта игры сам проходит вход в мир; каждые ~30 c пишет снапшот в `state.json` |
 | **bot** | Telegram long-polling **через SOCKS5-прокси** (с VM `api.telegram.org` напрямую недоступен); команды, кнопки, алерты |
+| **webui** | HTTP-панель на `0.0.0.0:8080` — то же, что бот, + правка ролей и просмотр логов; вход по логину/паролю |
 | *(+ поток `srvmonitor`)* | раз в 5 минут проверяет, есть ли сервер `AstralSigma` в списке публичных Steam-лобби |
 
 Вход в игру (`Game → Local → ✔ Show server in the public Steam list → Play → окно Login → Ok`) прогоняется отдельной задачей `SigmaNav` — фоновому потоку не даёт фокус окна `SetForegroundWindow`. Игра рендерится и принимает ввод только в **активной консольной сессии**; задача `SigmaConsoleGuard` возвращает сессию на консоль при отключении RDP.
@@ -33,6 +34,8 @@
        ├─ bot        Telegram long-poll через SOCKS5 (обёртка над curl.exe)
        │              ├─ поток-отправитель (сеть не блокирует опрос)
        │              └─ srvmonitor: раз в 5 мин serverlist.fetch → есть ли AstralSigma
+       ├─ webui      http.server на 0.0.0.0:8080 — тот же функционал + роли + логи
+       │              (статус из last_snapshot watchdog'а, живой collect() по кнопке)
        └─ вход в игру → runner.run_nav("seq login")
               └─ Start-ScheduledTask SigmaNav → nav.py (detect состояния экрана → клики)
 
@@ -52,7 +55,8 @@
 | `supervisor.py` | точка входа, lock, запуск watchdog + bot |
 | `watchdog.py` | цикл поддержания Steam/игры, авто-вход, алерты |
 | `bot.py` | команды и inline-кнопки Telegram, роли, аудит, фоновый монитор сервера |
-| `common.py` | конфиг, логи, `State` (в `state.json`), клиент Telegram поверх `curl.exe` + SOCKS5 |
+| `webui.py` | веб-панель (HTTP-поток в супервизоре): аутентификация, API, встроенный SPA; правка ролей на лету через `bot.apply_roles` |
+| `common.py` | конфиг (`load_config` / `save_config` без BOM), логи, `State` (в `state.json`), клиент Telegram поверх `curl.exe` + SOCKS5 |
 | `i18n.py` | двуязычные строки (`ru`/`en`) + `t()`; паритет ключей проверяет `selftest.py` |
 | `gamectl.py` | старт/стоп/рестарт Steam и игры, перезагрузка VM, отключение задачи бота |
 | `sysinfo.py` | сбор ресурсов, состояния Steam/игры/сессий |
@@ -108,6 +112,19 @@ Sigma World Online **не регистрирует game-серверы** в ма
 
 Состояние (`monitor_astral` в `state.json`) переживает перезапуск бота — повторных ложных тревог после рестарта нет.
 
+### Веб-панель
+
+HTTP-поток внутри супервизора (`webui.py`), слушает `webui.host:webui.port` (по умолчанию `0.0.0.0:8080`) — `http://<ip-vm>:8080/`. Правило фаервола на порт ставит `install.ps1`. Протокол обычный HTTP — панель **только для локальной сети**.
+
+- **Вход** — логин/пароль из `webui_auth.json` (в `base_dir`, в `.gitignore`). При первом запуске создаётся **`admin` / `admin`** с флагом `must_change`: до смены пароля доступен только экран смены (минимум 6 символов, не `admin`). Хэш — PBKDF2-HMAC-SHA256; сессия — cookie `sid` в памяти процесса (TTL 12 ч); POST защищены CSRF-токеном; неудачные входы — лок-аут по IP (5 попыток → пауза 60 c).
+- **Дашборд** — карты VM / Steam / игра / watchdog / внутренности бота (аптайм процесса, потоки, очередь отправки, возраст снапшота) / монитор сервера, плюс живой скриншот экрана VM. Автообновление раз в 5 c только при активной вкладке; статус берётся из `last_snapshot`, который пишет watchdog, — нагрузки на супервизор почти нет. Кнопка «Обновить (живой опрос)» дёргает `sysinfo.collect()` по требованию.
+- **Действия** — то же, что у бота: `startgame` / `stopgame` / `restartgame` (перезапуск + вход) / `restartsteam` / `login` / `watchdog on|off` / `restartvm` / `stopbot` (с подтверждением) + `restarttask` (чистый перезапуск задачи `SigmaSteamBot` отдельным процессом) и `testalert` (тестовое сообщение админам через `bot.push_alert`). Длинные операции идут заданием, панель опрашивает результат.
+- **Серверы** — тот же список Steam-лобби (`serverlist.fetch`, кэш 45 c), AstralSigma наверху.
+- **Роли** — правка `telegram.allowed_user_ids` / `moderator_user_ids` / `super_admin_id` / `default_lang` / `alerts_enabled`. Сохранение пишет `config.json` в чистом UTF-8 (`common.save_config`, без BOM) и **применяет роли на лету** (`Bot.apply_roles`) — перезапуск не нужен. Координаты `login_flow` из веба не редактируются намеренно.
+- **Логи** — хвост `supervisor.log` (фильтр по уровню, автообновление, скачивание), аудит панели (`webui_audit.log` — кто/когда/что нажал, отдельно от Telegram-аудита) и галерея скринов последовательности входа (`logs/nav/*.png`).
+
+Интерфейс двуязычный (ru/en, тумблер в шапке, выбор в `localStorage` браузера), тёмная/светлая тема. Отключить панель целиком — `webui.enabled = false` в `config.json`.
+
 ### Установка
 
 Подробный гайд — [`deploy/README.md`](deploy/README.md). Кратко: скопировать `deploy\` на VM → `setup.bat [BASE] [/autologon USER PASS]` → заполнить `%BASE%\config.json` → `selftest.py` → `Start-ScheduledTask -TaskName SigmaSteamBot`. Шаблон конфига — [`deploy/app/config.example.json`](deploy/app/config.example.json).
@@ -122,8 +139,9 @@ Sigma World Online **не регистрирует game-серверы** в ма
 | `steam_web_api_key` | ключ Steam Web API — запасной путь списка серверов |
 | `python_exe` | python для дочерних скриптов; пусто → авто (`sys.executable`, `pythonw`→`python`) |
 | `monitor` | `{ enabled, server_name, interval_seconds, misses_before_alert, repeat_alert_seconds }` |
+| `webui` | `{ enabled, host, port }` — веб-панель; `0.0.0.0:8080` по умолчанию. Креды — в `webui_auth.json` (не в конфиге) |
 | `telegram.token` | токен @BotFather |
-| `telegram.allowed_user_ids` / `moderator_user_ids` / `super_admin_id` | роли |
+| `telegram.allowed_user_ids` / `moderator_user_ids` / `super_admin_id` | роли (правятся и из веб-панели) |
 | `telegram.default_lang` | `ru` \| `en` |
 | `telegram.proxy` | `socks5h://HOST:PORT` — клиент всегда идёт через SOCKS5 |
 | `game_window_size` / `login_flow` | координаты кликов входа (жёстко под 1024×768) |
@@ -163,6 +181,7 @@ A single process (`supervisor.py`) launched by the `SigmaSteamBot` scheduled tas
 |---|---|
 | **watchdog** | keeps Steam and the game running; relaunches whatever died; after the game starts, walks the in-game login itself; writes a `state.json` snapshot every ~30 s |
 | **bot** | Telegram long-polling **through a SOCKS5 proxy** (`api.telegram.org` is unreachable directly from the VM); commands, buttons, alerts |
+| **webui** | HTTP panel on `0.0.0.0:8080` — same as the bot, plus role editing and log viewing; login/password auth |
 | *(+ `srvmonitor` thread)* | every 5 minutes checks whether the `AstralSigma` server is present in the public Steam lobby list |
 
 The in-game login (`Game → Local → ✔ Show server in the public Steam list → Play → Login window → Ok`) runs in a dedicated `SigmaNav` task — a background thread can't take window focus (`SetForegroundWindow`). The game renders and accepts input only in an **active console session**; the `SigmaConsoleGuard` task redirects the session back to the console when RDP disconnects.
@@ -176,6 +195,8 @@ SigmaSteamBot task (AtLogon, Interactive/Highest, auto-restart every 2 min)
        ├─ bot         Telegram long-poll via SOCKS5 (wrapper over curl.exe)
        │               ├─ sender thread (network never blocks polling)
        │               └─ srvmonitor: every 5 min serverlist.fetch → is AstralSigma listed
+       ├─ webui       http.server on 0.0.0.0:8080 — same features + roles + logs
+       │               (status from watchdog's last_snapshot, live collect() on demand)
        └─ game login → runner.run_nav("seq login")
               └─ Start-ScheduledTask SigmaNav → nav.py (screen-state detect → clicks)
 
@@ -195,7 +216,8 @@ SigmaConsoleGuard task (SYSTEM, on RDP-disconnect event)
 | `supervisor.py` | entry point, lock, starts watchdog + bot |
 | `watchdog.py` | Steam/game keep-alive loop, auto-login, alerts |
 | `bot.py` | Telegram commands and inline buttons, roles, audit, background server monitor |
-| `common.py` | config, logging, `State` (in `state.json`), Telegram client over `curl.exe` + SOCKS5 |
+| `webui.py` | web panel (HTTP thread in the supervisor): authentication, API, embedded SPA; live role editing via `bot.apply_roles` |
+| `common.py` | config (`load_config` / `save_config` without BOM), logging, `State` (in `state.json`), Telegram client over `curl.exe` + SOCKS5 |
 | `i18n.py` | bilingual strings (`ru`/`en`) + `t()`; key parity checked by `selftest.py` |
 | `gamectl.py` | start/stop/restart Steam and game, reboot VM, disable the bot task |
 | `sysinfo.py` | collects resources, Steam/game/session state |
@@ -251,6 +273,19 @@ The `srvmonitor` thread in the supervisor. First check ~90 s after start, then e
 
 State (`monitor_astral` in `state.json`) survives a bot restart — no repeated false alarms after a restart.
 
+### Web UI
+
+An HTTP thread inside the supervisor (`webui.py`), listening on `webui.host:webui.port` (default `0.0.0.0:8080`) — `http://<vm-ip>:8080/`. `install.ps1` adds the firewall rule for the port. Plain HTTP — the panel is **LAN-only**.
+
+- **Login** — username/password from `webui_auth.json` (in `base_dir`, gitignored). On first start it is created as **`admin` / `admin`** with a `must_change` flag: until the password is changed only the change-password screen is available (min 6 chars, not `admin`). Hash — PBKDF2-HMAC-SHA256; session — an in-memory `sid` cookie (12 h TTL); POSTs are CSRF-token protected; failed logins are rate-limited per IP (5 tries → 60 s lock-out).
+- **Dashboard** — VM / Steam / game / watchdog / bot-internals (process uptime, threads, send queue, snapshot age) / server-monitor cards, plus a live VM screenshot. Auto-refresh every 5 s only while the tab is visible; status comes from the `last_snapshot` the watchdog already writes — near-zero extra load on the supervisor. The “Refresh (live poll)” button calls `sysinfo.collect()` on demand.
+- **Actions** — same as the bot: `startgame` / `stopgame` / `restartgame` (restart + login) / `restartsteam` / `login` / `watchdog on|off` / `restartvm` / `stopbot` (confirmed) plus `restarttask` (clean restart of the `SigmaSteamBot` task from a detached process) and `testalert` (a test message to admins via `bot.push_alert`). Long operations run as a job the panel polls.
+- **Servers** — the same Steam-lobby list (`serverlist.fetch`, 45 s cache), AstralSigma pinned to the top.
+- **Roles** — editing `telegram.allowed_user_ids` / `moderator_user_ids` / `super_admin_id` / `default_lang` / `alerts_enabled`. Saving writes `config.json` as plain UTF-8 (`common.save_config`, no BOM) and **applies the roles live** (`Bot.apply_roles`) — no restart needed. `login_flow` coordinates are intentionally not editable from the web.
+- **Logs** — tail of `supervisor.log` (level filter, auto-refresh, download), the panel audit (`webui_audit.log` — who/when/what, separate from the Telegram audit) and a gallery of login-sequence screenshots (`logs/nav/*.png`).
+
+The interface is bilingual (ru/en, header toggle, choice in the browser `localStorage`), with a dark/light theme. Disable the panel entirely with `webui.enabled = false` in `config.json`.
+
 ### Install
 
 Full guide — [`deploy/README.md`](deploy/README.md). In short: copy `deploy\` to the VM → `setup.bat [BASE] [/autologon USER PASS]` → fill in `%BASE%\config.json` → `selftest.py` → `Start-ScheduledTask -TaskName SigmaSteamBot`. Config template — [`deploy/app/config.example.json`](deploy/app/config.example.json).
@@ -265,8 +300,9 @@ Full guide — [`deploy/README.md`](deploy/README.md). In short: copy `deploy\` 
 | `steam_web_api_key` | Steam Web API key — fallback path for the server list |
 | `python_exe` | python for child scripts; empty → auto (`sys.executable`, `pythonw`→`python`) |
 | `monitor` | `{ enabled, server_name, interval_seconds, misses_before_alert, repeat_alert_seconds }` |
+| `webui` | `{ enabled, host, port }` — web panel; `0.0.0.0:8080` by default. Credentials live in `webui_auth.json`, not in the config |
 | `telegram.token` | @BotFather token |
-| `telegram.allowed_user_ids` / `moderator_user_ids` / `super_admin_id` | roles |
+| `telegram.allowed_user_ids` / `moderator_user_ids` / `super_admin_id` | roles (also editable from the web panel) |
 | `telegram.default_lang` | `ru` \| `en` |
 | `telegram.proxy` | `socks5h://HOST:PORT` — the client always goes through SOCKS5 |
 | `game_window_size` / `login_flow` | login click coordinates (hard-tuned for 1024×768) |

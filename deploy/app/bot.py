@@ -77,18 +77,11 @@ class Bot:
         self.state = state
         self.wd = watchdog_ref
         tg = cfg["telegram"]
-        self._admins = set(tg.get("allowed_user_ids", []))
-        self._mods = set(tg.get("moderator_user_ids", [])) - self._admins
-        self.allowed = self._admins  # получатели широковещательных алертов
-        sa = tg.get("super_admin_id")
-        if not sa and tg.get("allowed_user_ids"):
-            sa = tg["allowed_user_ids"][0]
-        self._super_admin = sa
-        self._default_lang = i18n.norm(tg.get("default_lang", i18n.DEFAULT))
         self._who = {}  # uid -> отображаемое имя (для аудита)
+        self.apply_roles(tg)  # _admins / _mods / allowed / _super_admin / _default_lang / alerts_enabled
         self.tg = common.Telegram(tg["token"], tg["proxy"], tg.get("poll_timeout", 50))
-        self.alerts_enabled = tg.get("alerts_enabled", True)
         self._offset = 0
+        self._last_poll_ok = 0.0  # ts последнего успешного getUpdates (для веб-панели)
         self._stop = threading.Event()
         # (target, text): target=None -> всем админам; int -> конкретному uid
         self._outbox = queue.Queue()
@@ -100,6 +93,22 @@ class Bot:
         self._mon_interval = max(60, int(mon.get("interval_seconds", 300)))
         self._mon_misses_before = max(1, int(mon.get("misses_before_alert", 2)))
         self._mon_repeat = int(mon.get("repeat_alert_seconds", 3600))  # 0 = без напоминаний
+
+    def apply_roles(self, tg):
+        """Пересчитать роли и язык из telegram-блока конфига.
+
+        Вызывается из ``__init__`` и веб-панелью после правки ``config.json`` —
+        роли меняются на лету, без перезапуска супервизора.
+        """
+        self._admins = set(tg.get("allowed_user_ids", []))
+        self._mods = set(tg.get("moderator_user_ids", [])) - self._admins
+        self.allowed = self._admins  # получатели широковещательных алертов
+        sa = tg.get("super_admin_id")
+        if not sa and tg.get("allowed_user_ids"):
+            sa = tg["allowed_user_ids"][0]
+        self._super_admin = sa
+        self._default_lang = i18n.norm(tg.get("default_lang", i18n.DEFAULT))
+        self.alerts_enabled = tg.get("alerts_enabled", True)
 
     # ---------- отправка из любого потока (НЕ блокирует вызывающего) ----------
     def push_alert(self, text):
@@ -156,6 +165,7 @@ class Bot:
                     logging.warning("getUpdates: %s", r.get("error") or r.get("description") or r)
                     time.sleep(8)
                     continue
+                self._last_poll_ok = time.time()
                 for upd in r.get("result", []):
                     self._offset = upd["update_id"] + 1
                     try:
@@ -464,15 +474,8 @@ class Bot:
 
     def _do_shot(self, chat, lang):
         path = os.path.join(self.cfg["base_dir"], "logs", "shot.png")
-        hwnd = None
         try:
-            procs = sysinfo.find_procs(["sigmaworld.exe"], self.cfg.get("game_install_dir"))
-            if procs:
-                hwnd = screenshot.find_game_window([p.pid for p in procs])
-        except Exception:  # noqa: BLE001
-            logging.exception("shot: поиск окна игры")
-        try:
-            method, size = screenshot.capture(path, hwnd)
+            method, size = screenshot.capture_game(self.cfg, path)
         except Exception as e:  # noqa: BLE001
             logging.exception("shot: захват не удался")
             self.tg.send_message(chat, i18n.t(lang, "shot.capture_failed", err=html.escape(str(e))))

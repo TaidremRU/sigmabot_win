@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Быстрая проверка модулей без запуска бесконечного цикла."""
+import os
 import sys
 
 try:
@@ -13,6 +14,7 @@ import i18n
 import serverlist
 import serverlist_steam  # noqa: F401  (проверка, что модуль импортируется)
 import sysinfo
+import webui
 from bot import Bot
 from watchdog import Watchdog  # noqa: F401
 
@@ -28,6 +30,24 @@ print("роли: админов %d, модераторов %d, super_admin=%s, d
       % (len(tg.get("allowed_user_ids", [])),
          len(tg.get("moderator_user_ids", [])),
          tg.get("super_admin_id"), tg.get("default_lang", "ru")))
+
+# --- веб-панель: хранилище пароля + применение ролей на лету ---
+assert hasattr(Bot, "apply_roles"), "bot: нет метода apply_roles"
+assert hasattr(common, "save_config"), "common: нет save_config"
+_wa_path = os.path.join(os.path.dirname(__file__), "webui_auth_selftest.json")
+try:
+    os.remove(_wa_path)
+except OSError:
+    pass
+_wa = webui.AuthStore(_wa_path)
+assert _wa.verify("admin", "admin") and _wa.must_change, "webui: дефолт admin/admin не создан"
+assert not _wa.verify("admin", "wrong"), "webui: verify пропускает неверный пароль"
+_wa.set_password("s3cret-pass")
+assert _wa.verify("admin", "s3cret-pass") and not _wa.must_change, "webui: смена пароля не сработала"
+os.remove(_wa_path)
+_wcfg = cfg.get("webui", {}) or {}
+print("webui OK: auth admin/admin+must_change, PBKDF2, host=%s port=%s enabled=%s"
+      % (_wcfg.get("host", "0.0.0.0"), _wcfg.get("port", 8080), _wcfg.get("enabled", True)))
 
 _mon = cfg.get("monitor", {}) or {}
 print("монитор сервера: enabled=%s name=%r interval=%ss misses=%s repeat=%ss"

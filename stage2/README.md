@@ -7,11 +7,13 @@
 
 - **При входе в систему** (автологон пользователя `alex`) задача планировщика
   `SigmaSteamBot` запускает `supervisor.py`.
-- `supervisor.py` держит один процесс с двумя потоками:
+- `supervisor.py` держит один процесс с потоками:
   - **watchdog** — следит, что Steam и игра запущены; поднимает упавшее,
     шлёт события в Telegram, каждые 30 c пишет снапшот в `state.json`;
   - **bot** — long-polling Telegram Bot API **через SOCKS5-прокси
-    `192.168.0.222:2080`** (напрямую с VM `api.telegram.org` недоступен).
+    `192.168.0.222:2080`** (напрямую с VM `api.telegram.org` недоступен);
+  - **webui** — HTTP-панель на `0.0.0.0:8080` (то же, что бот, + правка ролей и
+    логи; вход по логину/паролю). Отключается `webui.enabled=false` в конфиге.
 - Игра запускается через `steam://rungameid/1690980`.
 
 ## Файлы
@@ -25,6 +27,7 @@
 | `gamectl.py` | запуск-останов Steam и игры, перезагрузка VM |
 | `watchdog.py` | цикл поддержания игры |
 | `bot.py` | команды и кнопки Telegram, фоновый монитор сервера |
+| `webui.py` | веб-панель: HTTP-поток в супервизоре, аутентификация (`webui_auth.json`), API, встроенный SPA, правка ролей на лету |
 | `serverlist.py` | `fetch(cfg)` — список серверов: Steam-лобби, при ошибке Web API |
 | `serverlist_steam.py` | перечисление Steam-лобби через `steam_api64.dll` игры (`ctypes`), отдельный процесс |
 | `supervisor.py` | точка входа, single-instance lock |
@@ -100,10 +103,38 @@ Sigma World Online не регистрирует game-серверы в маст
 один раз. Ошибка запроса списка — тик пропускается. Состояние (`monitor_astral`
 в `state.json`) переживает рестарт бота.
 
+## Веб-панель
+
+`webui.py` — HTTP-поток внутри супервизора, слушает `webui.host:webui.port`
+(`0.0.0.0:8080`). `http://<ip-vm>:8080/`. Правило фаервола ставит `install.ps1`.
+Обычный HTTP — **только для локальной сети**.
+
+- **Вход** — `webui_auth.json` в `base_dir` (в `.gitignore`). Первый запуск →
+  **`admin` / `admin`** с `must_change`: до смены пароля доступен только экран
+  смены (≥6 символов, не `admin`). PBKDF2-HMAC-SHA256; cookie-сессия в памяти
+  (12 ч); CSRF на POST; лок-аут по IP (5 неудач → 60 c).
+- **Дашборд** — VM / Steam / игра / watchdog / внутренности бота / монитор + живой
+  скрин. Автообновление 5 c при активной вкладке; статус из `last_snapshot`
+  watchdog'а, живой `sysinfo.collect()` — по кнопке.
+- **Действия** — `startgame` / `stopgame` / `restartgame` (перезапуск + вход) /
+  `restartsteam` / `login` / `watchdog on|off` / `restartvm` / `stopbot` (с
+  подтверждением) + `restarttask` (чистый перезапуск задачи отдельным процессом) и
+  `testalert`. Длинные операции — заданием с опросом результата.
+- **Серверы** — тот же `serverlist.fetch` (кэш 45 c).
+- **Роли** — `allowed_user_ids` / `moderator_user_ids` / `super_admin_id` /
+  `default_lang` / `alerts_enabled`. Сохранение → `common.save_config` (UTF-8 без
+  BOM) + `Bot.apply_roles` на лету, без перезапуска. `login_flow` из веба не
+  правится.
+- **Логи** — хвост `supervisor.log` (фильтр по уровню, автообновление, скачивание),
+  аудит панели `webui_audit.log` (кто/когда/что), галерея `logs/nav/*.png`.
+
+Двуязычно ru/en (тумблер в шапке), тёмная/светлая тема.
+
 ## Логи и состояние
 
 - `logs/supervisor.log` (ротация 5 МБ × 3)
 - `state.json` — счётчики + последний снапшот + `user_lang` + `monitor_astral`
+- `webui_auth.json` — логин/хэш пароля панели; `webui_audit.log` — действия из панели
 - `supervisor.lock` — PID работающего экземпляра
 
 ## Отключить

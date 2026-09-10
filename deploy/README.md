@@ -75,6 +75,7 @@ Telegram-бота. Держит Steam и игру запущенными, пос
 | `steam_web_api_key` | ключ https://steamcommunity.com/dev/apikey — запасной путь списка серверов; можно оставить пустым |
 | `python_exe` | python для дочерних скриптов; пусто → авто (`sys.executable`, `pythonw`→`python`) |
 | `monitor` | `{ enabled, server_name, interval_seconds, misses_before_alert, repeat_alert_seconds }` — фоновая проверка присутствия сервера в списке Steam-лобби |
+| `webui` | `{ enabled, host, port }` — веб-панель (см. §4a). `0.0.0.0:8080` по умолчанию; правило фаервола на порт ставит `install.ps1`. Креды — в `webui_auth.json` (не в конфиге) |
 | `telegram.token` | токен от @BotFather |
 | `telegram.allowed_user_ids` | `[280331544]` — numeric Telegram ID **администраторов** (полный доступ) |
 | `telegram.moderator_user_ids` | `[]` — ID **модераторов**: только `/status`, `/shot`, `/restartgame`, `/login`, `/lang`. ID, попавший и сюда, и в `allowed_user_ids`, считается админом |
@@ -164,6 +165,38 @@ Sigma World Online не публикует game-серверы в мастер-�
 
 ---
 
+## 4a. Веб-панель
+
+`webui.py` — HTTP-поток внутри супервизора (отдельная задача планировщика не
+нужна). Слушает `webui.host:webui.port` из `config.json` (по умолчанию
+`0.0.0.0:8080`) — открывайте `http://<ip-vm>:8080/`. Правило фаервола на этот порт
+добавляет `install.ps1` (`New-NetFirewallRule … "SigmaSteamBot Web UI"`). Протокол
+обычный **HTTP — панель только для локальной сети**.
+
+**Первый вход.** При старте создаётся `webui_auth.json` в `base_dir` с логином
+**`admin`** и паролем **`admin`** и флагом `must_change` — панель сразу показывает
+экран смены пароля и не пускает дальше, пока пароль не сменён (минимум 6 символов,
+не `admin`). Хэш пароля — PBKDF2-HMAC-SHA256. Сессия — cookie `sid` в памяти
+процесса (TTL 12 ч, теряется при перезапуске бота). POST-запросы защищены
+CSRF-токеном; после 5 неудачных входов IP блокируется на 60 c. Сбросить пароль —
+удалить `webui_auth.json` и перезапустить задачу (снова будет `admin`/`admin`).
+
+**Что умеет** (то же, что бот, плюс роли и логи):
+
+| Раздел | Содержимое |
+|---|---|
+| Дашборд | карты VM / Steam / игра / watchdog / внутренности бота / монитор сервера + живой скриншот. Автообновление 5 c только при активной вкладке; статус из `state.json` → `last_snapshot`, живой `sysinfo.collect()` — по кнопке «Обновить (живой опрос)» |
+| Действия | `startgame` / `stopgame` / `restartgame` (перезапуск + вход) / `restartsteam` / `login` / `watchdog on\|off` / `restartvm` / `stopbot` (с подтверждением) + `restarttask` (чистый перезапуск задачи `SigmaSteamBot` отдельным процессом `cmd`) и `testalert` (тестовое сообщение админам через Telegram). Длинная операция запускается заданием, панель опрашивает результат |
+| Серверы | тот же список Steam-лобби (`serverlist.fetch`, кэш 45 c) |
+| Роли | правка `telegram.allowed_user_ids` / `moderator_user_ids` / `super_admin_id` / `default_lang` / `alerts_enabled`. Пишет `config.json` в чистом UTF-8 (без BOM) и применяет роли **на лету** — перезапуск не нужен. Координаты `login_flow` из веба не редактируются |
+| Логи | хвост `logs\supervisor.log` (фильтр по уровню, автообновление, «Скачать»), аудит панели `webui_audit.log` (кто/когда/что нажал — отдельно от Telegram-аудита), галерея `logs\nav\*.png` (скрины последовательности входа) |
+
+Интерфейс двуязычный (ru/en, тумблер в шапке, выбор в `localStorage` браузера),
+тёмная/светлая тема. Отключить панель целиком — `"webui": { "enabled": false }` в
+`config.json`.
+
+---
+
 ## 5. Подгонка координат кликов (если другое разрешение / версия игры)
 
 Координаты в `login_flow` — пиксели ОТНОСИТЕЛЬНО левого-верхнего угла окна игры
@@ -198,6 +231,8 @@ REM скрин: %BASE%\logs\nav\latest.png  — по нему меряете к�
        │              login_settle_seconds -> авто-вход; пишет state.json
        ├─ bot       — Telegram long-poll через SOCKS5 (обёртка над curl.exe),
        │              отдельный поток-отправитель, чтобы сеть не блокировала
+       ├─ webui     — http.server на 0.0.0.0:8080 (см. §4a): тот же функционал,
+       │              + роли + логи; статус из last_snapshot, без нагрузки на цикл
        └─ авто-вход и /login  ->  runner.run_nav("seq login")
               └─ Start-ScheduledTask SigmaNav   (нужен реальный фокус окна —
                      фоновый поток супервизора SetForegroundWindow не может)
@@ -215,6 +250,7 @@ REM скрин: %BASE%\logs\nav\latest.png  — по нему меряете к�
 заходят — смотрят через `/shot`.
 
 Файлы в `%BASE%`: `*.py` (код), `config.json`, `state.json` (счётчики+снапшот),
+`webui_auth.json` (логин/хэш пароля панели), `webui_audit.log` (действия из панели),
 `logs\supervisor.log` (ротация 5МБ×3), `logs\nav\*.png` (скрины шагов, авто-чистка
 до 80), `supervisor.lock`, `nav_cmd.txt`/`nav_out.txt` (обмен с SigmaNav).
 

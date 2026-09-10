@@ -25,6 +25,26 @@ def load_config():
     return _cfg
 
 
+def save_config(cfg=None):
+    """Атомарно записать config.json в чистом UTF-8 (БЕЗ BOM).
+
+    ``json.load`` в проекте читает конфиг как обычный ``utf-8`` — BOM (который
+    оставляет, например, PowerShell ``Set-Content -Encoding UTF8``) валит разбор и
+    роняет супервизор. ``open(..., encoding="utf-8")`` в Python BOM не пишет.
+    Обновляет и кэш ``_cfg`` — все, кто держит ссылку из ``load_config()``, видят
+    изменения (роли применяются на лету без перезапуска).
+    """
+    global _cfg
+    data = cfg if cfg is not None else _cfg
+    if data is None:
+        raise ValueError("save_config: нет данных конфига")
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CONFIG_PATH)
+    _cfg = data
+
+
 def setup_logging(name="supervisor"):
     cfg = load_config()
     log_dir = os.path.join(cfg.get("base_dir", BASE_DIR), "logs")

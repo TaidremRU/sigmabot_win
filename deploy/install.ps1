@@ -93,6 +93,20 @@ if (Test-Path $startCmd) {
   Write-Output "[--] start-bot.cmd не найден в $BaseDir — ярлык пропущен"
 }
 
+# --- правило фаервола на порт веб-панели (webui.host:webui.port из config.json) ---
+$WebPort = 8080
+try {
+  $cfgFile = Join-Path $BaseDir 'config.json'
+  if (Test-Path $cfgFile) {
+    $wj = (Get-Content $cfgFile -Raw -Encoding UTF8 | ConvertFrom-Json).webui
+    if ($wj -and $wj.port) { $WebPort = [int]$wj.port }
+  }
+} catch { Write-Output "[--] не удалось прочитать webui.port из config.json, беру $WebPort" }
+Get-NetFirewallRule -DisplayName 'SigmaSteamBot Web UI' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+New-NetFirewallRule -DisplayName 'SigmaSteamBot Web UI' -Direction Inbound -Action Allow `
+    -Protocol TCP -LocalPort $WebPort -Profile Any | Out-Null
+Write-Output "[ok] фаервол: входящий TCP $WebPort разрешён (веб-панель) -> http://<ip-vm>:$WebPort/  (вход admin/admin, смените при первом входе)"
+
 Get-ScheduledTask -TaskName 'SigmaSteamBot','SigmaNav','SigmaConsoleGuard' | Select-Object TaskName, State | Format-Table -AutoSize
 Write-Output ""
 Write-Output "Готово. Запустить сейчас:  Start-ScheduledTask -TaskName SigmaSteamBot"

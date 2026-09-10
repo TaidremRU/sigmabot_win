@@ -45,6 +45,7 @@ def main():
     common.setup_logging("supervisor")
     if not _acquire_lock():
         sys.exit(0)
+    web = None
     try:
         cfg = common.load_config()
         state = common.State(os.path.join(cfg["base_dir"], "state.json"))
@@ -56,11 +57,28 @@ def main():
         wd = Watchdog(cfg, state, alert=bot.push_alert)
         bot.wd = wd
         wd.start()
-        logging.info("supervisor: watchdog запущен, стартую бота")
+
+        if (cfg.get("webui", {}) or {}).get("enabled", True):
+            try:
+                from webui import WebUI
+
+                web = WebUI(cfg, state, bot, wd)
+                web.start()
+            except Exception:  # noqa: BLE001
+                logging.exception("supervisor: веб-панель не запустилась (продолжаю без неё)")
+                web = None
+
+        logging.info("supervisor: watchdog запущен%s, стартую бота",
+                     ", веб-панель запущена" if web else "")
         bot.run()
     except KeyboardInterrupt:
         logging.info("остановка по Ctrl+C")
     finally:
+        if web:
+            try:
+                web.stop()
+            except Exception:  # noqa: BLE001
+                pass
         _release_lock()
 
 

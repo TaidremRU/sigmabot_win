@@ -62,5 +62,19 @@ Register-ScheduledTask -TaskName 'SigmaConsoleGuard' -Action $cgAct -Trigger $cg
     -Settings (New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew) -Force | Out-Null
 Write-Output "[ok] task SigmaConsoleGuard registered (RDP-disconnect -> tscon console)"
 
+# --- Firewall rule for the Web UI port (webui.host:webui.port from config.json) ---
+$WebPort = 8080
+try {
+  $cfgFile = Join-Path $Base 'config.json'
+  if (Test-Path $cfgFile) {
+    $wj = (Get-Content $cfgFile -Raw -Encoding UTF8 | ConvertFrom-Json).webui
+    if ($wj -and $wj.port) { $WebPort = [int]$wj.port }
+  }
+} catch { Write-Output "[--] could not read webui.port from config.json, using $WebPort" }
+Get-NetFirewallRule -DisplayName 'SigmaSteamBot Web UI' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+New-NetFirewallRule -DisplayName 'SigmaSteamBot Web UI' -Direction Inbound -Action Allow `
+    -Protocol TCP -LocalPort $WebPort -Profile Any | Out-Null
+Write-Output "[ok] firewall: inbound TCP $WebPort allowed (Web UI). Open http://<vm-ip>:$WebPort/  (login admin/admin, change on first use)"
+
 Get-ScheduledTask -TaskName 'SigmaSteamBot', 'SigmaNav', 'SigmaConsoleGuard' | Select-Object TaskName, State | Format-Table -AutoSize
 Write-Output "Done. Start now with:  Start-ScheduledTask -TaskName SigmaSteamBot"

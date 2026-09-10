@@ -124,6 +124,24 @@ def _pw_capture(hwnd, path, flags, client=False):
     return img.size
 
 
+def capture_game(cfg, path):
+    """Снять окно игры (как для /shot): найти процессы игры -> её окно -> capture.
+
+    Возвращает ``(method, (w, h))`` или бросает ``OSError``. Используется и ботом
+    (Telegram /shot), и веб-панелью (GET /api/shot).
+    """
+    import sysinfo
+
+    hwnd = None
+    try:
+        procs = sysinfo.find_procs(["sigmaworld.exe"], cfg.get("game_install_dir"))
+        if procs:
+            hwnd = find_game_window([p.pid for p in procs])
+    except Exception:  # noqa: BLE001
+        logging.exception("capture_game: поиск окна игры")
+    return capture(path, hwnd)
+
+
 def _imagegrab(path):
     from PIL import ImageGrab
 

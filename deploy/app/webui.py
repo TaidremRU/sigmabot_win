@@ -1,0 +1,1282 @@
+# -*- coding: utf-8 -*-
+"""Веб-панель управления SigmaSteamBot (HTTP на 0.0.0.0).
+
+Запускается **потоком внутри supervisor.py** — как ``bot`` и ``watchdog``, —
+поэтому держит прямые ссылки на ``bot`` / ``watchdog`` / ``cfg`` / ``state``:
+watchdog-тумблер, правка ролей на лету и остановка бота работают без IPC.
+
+Нагрузка на супервизор минимальна: ``GET /api/state`` отдаёт последний снапшот,
+который watchdog и так пишет в ``state.json`` (``last_snapshot``). Живой
+``sysinfo.collect()`` — только по запросу ``?live=1`` (кнопка «обновить сейчас»).
+
+Аутентификация: ``webui_auth.json`` в ``base_dir`` (в .gitignore). При первом
+запуске создаётся с логином **admin / admin** и требованием сменить пароль
+(``must_change``) — до смены доступен только экран смены пароля. Хэш —
+PBKDF2-HMAC-SHA256. Сессия — cookie ``sid`` (в памяти процесса). POST-запросы
+защищены CSRF-токеном (заголовок ``X-CSRF-Token``). Неудачные входы — с лок-аутом
+по IP.
+
+Протокол — обычный HTTP: панель только для локальной сети (как и остальной
+доступ к этому боксу).
+"""
+import hashlib
+import http.cookies
+import json
+import logging
+import os
+import re
+import secrets
+import subprocess
+import threading
+import time
+import urllib.parse
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import common
+import gamectl
+import i18n
+import screenshot
+import serverlist
+import sysinfo
+
+try:
+    import psutil
+except Exception:  # noqa: BLE001
+    psutil = None
+
+VERSION = "1.0"
+SESSION_TTL = 12 * 3600
+SHOT_MIN_INTERVAL = 4.0
+SERVERS_CACHE_SEC = 45
+
+
+def _now_iso():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+class _Bad(Exception):
+    """Ошибка валидации ввода — отдаётся клиенту как 400."""
+
+
+# --------------------------------------------------------------------------- auth
+class AuthStore:
+    """Логин/пароль веб-панели в ``webui_auth.json`` (PBKDF2-HMAC-SHA256)."""
+
+    ITERS = 200_000
+
+    def __init__(self, path):
+        self.path = path
+        self._lock = threading.Lock()
+        self._load_or_init()
+
+    def _load_or_init(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                self.d = json.load(f)
+            if not {"username", "salt", "hash"} <= set(self.d):
+                raise ValueError("неполный файл")
+        except FileNotFoundError:
+            self.d = self._make("admin", "admin", must_change=True)
+            self._save()
+            logging.warning(
+                "webui: создан %s — вход admin/admin, СМЕНИТЕ ПАРОЛЬ при первом входе", self.path
+            )
+        except Exception:  # noqa: BLE001
+            logging.exception("webui: %s повреждён — пересоздаю admin/admin", self.path)
+            self.d = self._make("admin", "admin", must_change=True)
+            self._save()
+
+    def _make(self, user, pw, must_change):
+        salt = secrets.token_bytes(16)
+        return {
+            "username": user,
+            "algo": "pbkdf2_sha256",
+            "iterations": self.ITERS,
+            "salt": salt.hex(),
+            "hash": self._hash(pw, salt, self.ITERS),
+            "must_change": bool(must_change),
+            "updated": _now_iso(),
+        }
+
+    @staticmethod
+    def _hash(pw, salt, iters):
+        return hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, iters).hex()
+
+    @property
+    def username(self):
+        return self.d.get("username", "admin")
+
+    @property
+    def must_change(self):
+        return bool(self.d.get("must_change"))
+
+    def verify(self, user, pw):
+        if user != self.d.get("username"):
+            return False
+        got = self._hash(pw, bytes.fromhex(self.d["salt"]), int(self.d.get("iterations", self.ITERS)))
+        return secrets.compare_digest(got, self.d.get("hash", ""))
+
+    def set_password(self, newpw, newuser=None):
+        with self._lock:
+            self.d = self._make(newuser or self.username, newpw, must_change=False)
+            self._save()
+
+    def _save(self):
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.d, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self.path)
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
+
+
+class Sessions:
+    """Сессии в памяти: token -> {user, ip, csrf, born, seen}."""
+
+    def __init__(self):
+        self._d = {}
+        self._lock = threading.Lock()
+
+    def new(self, user, ip):
+        tok = secrets.token_urlsafe(32)
+        csrf = secrets.token_urlsafe(24)
+        with self._lock:
+            self._d[tok] = {"user": user, "ip": ip, "csrf": csrf,
+                            "born": time.time(), "seen": time.time()}
+        return tok, csrf
+
+    def get(self, tok):
+        with self._lock:
+            s = self._d.get(tok)
+            if not s:
+                return None
+            if time.time() - s["seen"] > SESSION_TTL:
+                self._d.pop(tok, None)
+                return None
+            s["seen"] = time.time()
+            return dict(s)
+
+    def drop(self, tok):
+        with self._lock:
+            self._d.pop(tok, None)
+
+
+class Throttle:
+    """Лок-аут входа по IP: N неудач за window -> блок на block секунд."""
+
+    def __init__(self, max_fail=5, window=300, block=60):
+        self.max_fail, self.window, self.block = max_fail, window, block
+        self._d = {}
+        self._lock = threading.Lock()
+
+    def check(self, ip):
+        with self._lock:
+            e = self._d.get(ip)
+            if not e:
+                return True, 0
+            if e.get("until", 0) > time.time():
+                return False, int(e["until"] - time.time())
+            return True, 0
+
+    def fail(self, ip):
+        with self._lock:
+            e = self._d.setdefault(ip, {"fails": 0, "first": time.time(), "until": 0})
+            if time.time() - e["first"] > self.window:
+                e["fails"], e["first"] = 0, time.time()
+            e["fails"] += 1
+            if e["fails"] >= self.max_fail:
+                e["until"] = time.time() + self.block
+                e["fails"], e["first"] = 0, time.time()
+
+    def ok(self, ip):
+        with self._lock:
+            self._d.pop(ip, None)
+
+
+# ------------------------------------------------------------------- log helpers
+_LOG_RX = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d+) (\w+) \[([^\]]*)\] (.*)$")
+
+
+def _tail(path, nbytes):
+    try:
+        sz = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if sz > nbytes:
+                f.seek(sz - nbytes)
+            data = f.read()
+    except OSError:
+        return ""
+    text = data.decode("utf-8", "replace")
+    if sz > nbytes:
+        text = text.split("\n", 1)[-1]
+    return text
+
+
+def _parse_log(text):
+    out = []
+    for ln in text.splitlines():
+        m = _LOG_RX.match(ln)
+        if m:
+            out.append({"ts": m.group(1), "level": m.group(2),
+                        "thread": m.group(3), "msg": m.group(4)})
+        elif out:
+            out[-1]["msg"] += "\n" + ln
+        else:
+            out.append({"ts": "", "level": "", "thread": "", "msg": ln})
+    return out
+
+
+# --------------------------------------------------------------------- the server
+class _Handler(BaseHTTPRequestHandler):
+    server_version = "SigmaWebUI/" + VERSION
+
+    def log_message(self, fmt, *args):  # тише стандартного вывода в stderr
+        logging.debug("webui %s %s", self.address_string(), fmt % args)
+
+    def do_GET(self):
+        self.server.webui.dispatch(self, "GET")
+
+    def do_POST(self):
+        self.server.webui.dispatch(self, "POST")
+
+
+class WebUI:
+    def __init__(self, cfg, state, bot, wd):
+        self.cfg = cfg
+        self.state = state
+        self.bot = bot
+        self.wd = wd
+        base = cfg.get("base_dir", common.BASE_DIR)
+        self.auth = AuthStore(os.path.join(base, "webui_auth.json"))
+        self.sessions = Sessions()
+        self.throttle = Throttle()
+        self._audit_path = os.path.join(base, "webui_audit.log")
+        self._audit_lock = threading.Lock()
+        self._srv = None
+        self._thread = None
+        self._srv_cache = None  # (ts, payload)
+        self._shot_lock = threading.Lock()
+        self._shot_ts = 0.0
+        self._shot_meta = ("", (0, 0))
+        self._jobs = {}
+        self._jobs_lock = threading.Lock()
+
+    # ---------------------------------------------------------------- lifecycle
+    def start(self):
+        w = self.cfg.get("webui", {}) or {}
+        host = w.get("host", "0.0.0.0")
+        port = int(w.get("port", 8080))
+        self._srv = ThreadingHTTPServer((host, port), _Handler)
+        self._srv.daemon_threads = True
+        self._srv.webui = self
+        self._thread = threading.Thread(target=self._srv.serve_forever, name="webui", daemon=True)
+        self._thread.start()
+        logging.info("webui: слушаю http://%s:%d/ — вход %s%s", host, port, self.auth.username,
+                     "  (СМЕНИТЕ ПАРОЛЬ)" if self.auth.must_change else "")
+
+    def stop(self):
+        try:
+            if self._srv:
+                self._srv.shutdown()
+                self._srv.server_close()
+                logging.info("webui: остановлена")
+        except Exception:  # noqa: BLE001
+            logging.exception("webui: ошибка остановки")
+
+    # ------------------------------------------------------------------- audit
+    def audit(self, ip, user, msg):
+        line = "%s\t%s\t%s\t%s\n" % (_now_iso(), ip, user, msg)
+        try:
+            with self._audit_lock, open(self._audit_path, "a", encoding="utf-8") as f:
+                f.write(line)
+        except OSError:
+            logging.exception("webui: не удалось записать аудит")
+        logging.info("webui audit: %s [%s] %s", user, ip, msg)
+
+    # ------------------------------------------------------------- http helpers
+    def _send(self, h, status, ctype, body, extra=None):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        try:
+            h.send_response(status)
+            h.send_header("Content-Type", ctype)
+            h.send_header("Content-Length", str(len(body)))
+            h.send_header("X-Content-Type-Options", "nosniff")
+            h.send_header("Referrer-Policy", "no-referrer")
+            for k, v in (extra or {}).items():
+                h.send_header(k, v)
+            h.end_headers()
+            if h.command != "HEAD":
+                h.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _json(self, h, obj, status=200, set_cookie=None):
+        extra = {"Cache-Control": "no-store"}
+        if set_cookie:
+            extra["Set-Cookie"] = set_cookie
+        self._send(h, status, "application/json; charset=utf-8",
+                   json.dumps(obj, ensure_ascii=False, default=str), extra)
+
+    def _body(self, h):
+        try:
+            n = int(h.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        raw = h.rfile.read(n) if n > 0 else b""
+        if not raw:
+            return {}
+        try:
+            v = json.loads(raw.decode("utf-8"))
+            return v if isinstance(v, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _session_of(self, h):
+        c = http.cookies.SimpleCookie(h.headers.get("Cookie", ""))
+        tok = c["sid"].value if "sid" in c else ""
+        return (tok, self.sessions.get(tok)) if tok else ("", None)
+
+    # ---------------------------------------------------------------- dispatch
+    def dispatch(self, h, method):
+        try:
+            path, _, qs = h.path.partition("?")
+            q = urllib.parse.parse_qs(qs)
+            if path in ("/", "/index.html") and method == "GET":
+                return self._send(h, 200, "text/html; charset=utf-8", PAGE,
+                                  {"Cache-Control": "no-store"})
+            if path == "/favicon.ico":
+                return self._send(h, 204, "text/plain", b"")
+            if not path.startswith("/api/"):
+                return self._send(h, 404, "text/plain; charset=utf-8", b"not found")
+
+            route = path[len("/api/"):].strip("/")
+            if route == "session" and method == "GET":
+                return self._api_session(h)
+            if route == "login" and method == "POST":
+                return self._api_login(h)
+
+            tok, sess = self._session_of(h)
+            if not sess:
+                return self._json(h, {"error": "auth"}, 401)
+
+            if method == "POST":
+                given = h.headers.get("X-CSRF-Token", "")
+                if not given or not secrets.compare_digest(given, sess["csrf"]):
+                    return self._json(h, {"error": "csrf"}, 403)
+
+            if route == "logout" and method == "POST":
+                self.sessions.drop(tok)
+                return self._json(h, {"ok": True}, set_cookie="sid=; Path=/; Max-Age=0")
+            if route == "password" and method == "POST":
+                return self._api_password(h, sess)
+
+            if self.auth.must_change:
+                return self._json(h, {"error": "must_change"}, 403)
+
+            fn = getattr(self, "_api_" + route.replace("-", "_"), None)
+            if not fn:
+                return self._json(h, {"error": "unknown"}, 404)
+            return fn(h, method, q, sess)
+        except Exception as e:  # noqa: BLE001
+            logging.exception("webui: dispatch %s %s", method, getattr(h, "path", "?"))
+            try:
+                self._json(h, {"error": "internal", "detail": str(e)}, 500)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ------------------------------------------------------------------ public
+    def _api_session(self, h):
+        _, sess = self._session_of(h)
+        out = {"app": "SigmaSteamBot", "version": VERSION, "authed": bool(sess),
+               "langs": list(i18n.SUPPORTED)}
+        if sess:
+            out.update(username=sess["user"], csrf=sess["csrf"], must_change=self.auth.must_change)
+        return self._json(h, out)
+
+    def _api_login(self, h):
+        ip = h.client_address[0]
+        ok, wait = self.throttle.check(ip)
+        if not ok:
+            return self._json(h, {"error": "throttled", "retry": wait}, 429)
+        b = self._body(h)
+        user = (b.get("username") or "").strip()
+        pw = b.get("password") or ""
+        if user and pw and self.auth.verify(user, pw):
+            self.throttle.ok(ip)
+            tok, csrf = self.sessions.new(user, ip)
+            self.audit(ip, user, "вход в панель")
+            return self._json(
+                h, {"ok": True, "username": user, "csrf": csrf, "must_change": self.auth.must_change},
+                set_cookie="sid=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d" % (tok, SESSION_TTL),
+            )
+        self.throttle.fail(ip)
+        logging.warning("webui: неудачный вход user=%r ip=%s", user, ip)
+        return self._json(h, {"error": "bad_credentials"}, 401)
+
+    def _api_password(self, h, sess):
+        b = self._body(h)
+        old, new = b.get("old") or "", b.get("new") or ""
+        if not self.auth.verify(sess["user"], old):
+            return self._json(h, {"error": "bad_old"}, 403)
+        if len(new) < 6:
+            return self._json(h, {"error": "too_short"}, 400)
+        if new.lower() in ("admin", "password", sess["user"].lower()):
+            return self._json(h, {"error": "too_weak"}, 400)
+        self.auth.set_password(new)
+        self.audit(h.client_address[0], sess["user"], "смена пароля")
+        return self._json(h, {"ok": True})
+
+    # ------------------------------------------------------------------ state
+    def _internals(self):
+        now = time.time()
+        st = self.state.data
+        mon = st.get("monitor_astral") or {}
+        snap_ts = (st.get("last_snapshot") or {}).get("ts")
+        info = {
+            "threads": threading.active_count(),
+            "thread_names": sorted(t.name for t in threading.enumerate()),
+            "outbox": self.bot._outbox.qsize(),
+            "last_poll_ok_age": int(now - self.bot._last_poll_ok) if getattr(self.bot, "_last_poll_ok", 0) else None,
+            "snapshot_age": int(now - snap_ts) if snap_ts else None,
+            "monitor": {
+                "name": getattr(self.bot, "_mon_name", None),
+                "enabled": getattr(self.bot, "_mon_enabled", None),
+                "present": mon.get("present"),
+                "misses": mon.get("misses", 0),
+                "alerted": bool(mon.get("alerted")),
+            },
+        }
+        if psutil is not None:
+            try:
+                info["proc_uptime"] = int(now - psutil.Process().create_time())
+            except Exception:  # noqa: BLE001
+                info["proc_uptime"] = None
+        return info
+
+    def _api_state(self, h, method, q, sess):
+        live = q.get("live", ["0"])[0] == "1"
+        if live:
+            try:
+                snap = sysinfo.collect(self.cfg, self.state)
+            except Exception as e:  # noqa: BLE001
+                logging.exception("webui: live collect")
+                snap, live = dict(self.state.data.get("last_snapshot") or {}), False
+                snap["_live_error"] = str(e)
+        else:
+            snap = dict(self.state.data.get("last_snapshot") or {})
+        tg = self.cfg.get("telegram", {})
+        return self._json(h, {
+            "snapshot": snap,
+            "live": live,
+            "watchdog_enabled": bool(self.wd.enabled) if self.wd else None,
+            "login_state": self.state.data.get("login_state"),
+            "internals": self._internals(),
+            "roles": {
+                "admins": len(tg.get("allowed_user_ids", [])),
+                "mods": len(tg.get("moderator_user_ids", [])),
+                "alerts_enabled": bool(tg.get("alerts_enabled", True)),
+                "default_lang": tg.get("default_lang", "ru"),
+            },
+            "now": time.time(),
+        })
+
+    # ---------------------------------------------------------------- servers
+    def _api_servers(self, h, method, q, sess):
+        now = time.time()
+        if not self._srv_cache or now - self._srv_cache[0] > SERVERS_CACHE_SEC:
+            try:
+                ok, res, src = serverlist.fetch(self.cfg)
+            except Exception as e:  # noqa: BLE001
+                logging.exception("webui: serverlist")
+                ok, res, src = False, str(e), "none"
+            self._srv_cache = (now, {"ok": ok, "servers": res if ok else [],
+                                     "error": None if ok else str(res), "source": src})
+        ts, payload = self._srv_cache
+        out = dict(payload)
+        out["cached_age"] = int(now - ts)
+        return self._json(h, out)
+
+    # --------------------------------------------------------------- screenshot
+    def _api_shot(self, h, method, q, sess):
+        path = os.path.join(self.cfg.get("base_dir", common.BASE_DIR), "logs", "webshot.png")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with self._shot_lock:
+            fresh = os.path.isfile(path) and (time.time() - self._shot_ts) < SHOT_MIN_INTERVAL
+            if not fresh:
+                try:
+                    self._shot_meta = screenshot.capture_game(self.cfg, path)
+                    self._shot_ts = time.time()
+                except Exception as e:  # noqa: BLE001
+                    logging.warning("webui: shot: %s", e)
+                    return self._json(h, {"error": "capture", "detail": str(e)}, 503)
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except OSError as e:
+                return self._json(h, {"error": "read", "detail": str(e)}, 503)
+        m, sz = self._shot_meta
+        return self._send(h, 200, "image/png", data, {
+            "Cache-Control": "no-store",
+            "X-Shot-Method": str(m),
+            "X-Shot-Size": "%sx%s" % (sz[0], sz[1]),
+        })
+
+    # -------------------------------------------------------------------- logs
+    def _log_path(self):
+        return os.path.join(self.cfg.get("base_dir", common.BASE_DIR), "logs", "supervisor.log")
+
+    def _api_log(self, h, method, q, sess):
+        try:
+            n = min(2000, max(10, int((q.get("n") or ["300"])[0])))
+        except ValueError:
+            n = 300
+        lvl = (q.get("level") or ["ALL"])[0].upper()
+        text = _tail(self._log_path(), 512 * 1024)
+        if (q.get("fmt") or [""])[0] == "txt":
+            return self._send(h, 200, "text/plain; charset=utf-8", text, {
+                "Content-Disposition": "attachment; filename=supervisor-tail.log",
+            })
+        rows = _parse_log(text)
+        if lvl != "ALL":
+            keep = {"WARN": ("WARNING", "ERROR", "CRITICAL")}.get(lvl, (lvl,))
+            rows = [r for r in rows if r["level"] in keep]
+        return self._json(h, {"lines": rows[-n:], "file": self._log_path()})
+
+    def _api_audit(self, h, method, q, sess):
+        rows = []
+        for ln in _tail(self._audit_path, 128 * 1024).splitlines():
+            parts = ln.split("\t", 3)
+            if len(parts) == 4:
+                rows.append({"ts": parts[0], "ip": parts[1], "user": parts[2], "msg": parts[3]})
+        return self._json(h, {"lines": rows[-400:]})
+
+    def _nav_dir(self):
+        return os.path.realpath(os.path.join(self.cfg.get("base_dir", common.BASE_DIR), "logs", "nav"))
+
+    def _api_nav_shots(self, h, method, q, sess):
+        d = self._nav_dir()
+        out = []
+        try:
+            for nm in os.listdir(d):
+                if nm.lower().endswith(".png"):
+                    fp = os.path.join(d, nm)
+                    out.append({"name": nm, "age": int(time.time() - os.path.getmtime(fp)),
+                                "size": os.path.getsize(fp)})
+        except OSError:
+            pass
+        out.sort(key=lambda x: x["age"])
+        return self._json(h, {"shots": out})
+
+    def _api_nav_shot(self, h, method, q, sess):
+        nm = (q.get("name") or [""])[0]
+        if not re.match(r"^[\w.\-]{1,64}\.png$", nm):
+            return self._json(h, {"error": "bad_name"}, 400)
+        d = self._nav_dir()
+        fp = os.path.realpath(os.path.join(d, nm))
+        if not (fp == os.path.join(d, nm) and os.path.isfile(fp)):
+            return self._json(h, {"error": "not_found"}, 404)
+        try:
+            with open(fp, "rb") as f:
+                data = f.read()
+        except OSError:
+            return self._json(h, {"error": "read"}, 404)
+        return self._send(h, 200, "image/png", data, {"Cache-Control": "no-store"})
+
+    # ------------------------------------------------------------------- roles
+    def _api_roles(self, h, method, q, sess):
+        tg = self.cfg.get("telegram", {}) or {}
+        if method == "GET":
+            return self._json(h, {
+                "allowed_user_ids": tg.get("allowed_user_ids", []),
+                "moderator_user_ids": tg.get("moderator_user_ids", []),
+                "super_admin_id": tg.get("super_admin_id"),
+                "default_lang": tg.get("default_lang", "ru"),
+                "alerts_enabled": bool(tg.get("alerts_enabled", True)),
+            })
+
+        b = self._body(h)
+
+        def ids(key):
+            v = b.get(key, [])
+            if isinstance(v, str):
+                v = [x for x in re.split(r"[\s,]+", v) if x]
+            elif not isinstance(v, list):
+                raise _Bad("%s: ожидается список" % key)
+            out, seen = [], set()
+            for x in v:
+                try:
+                    n = int(str(x).strip())
+                except (TypeError, ValueError):
+                    raise _Bad("нечисловой Telegram ID в «%s»: %r" % (key, x))
+                if n not in seen:
+                    seen.add(n)
+                    out.append(n)
+            return out
+
+        try:
+            admins = ids("allowed_user_ids")
+            mods = ids("moderator_user_ids")
+            if not admins:
+                raise _Bad("нужен хотя бы один администратор")
+            sa = b.get("super_admin_id")
+            sa = int(sa) if str(sa).strip() not in ("", "None", "null") else None
+            if sa is not None and sa not in admins:
+                raise _Bad("super_admin_id должен быть среди администраторов")
+        except _Bad as e:
+            return self._json(h, {"error": "invalid", "detail": str(e)}, 400)
+        except (TypeError, ValueError):
+            return self._json(h, {"error": "invalid", "detail": "super_admin_id должен быть числом"}, 400)
+
+        lang = (b.get("default_lang") or "ru").lower()
+        if lang not in i18n.SUPPORTED:
+            lang = "ru"
+        alerts = bool(b.get("alerts_enabled", True))
+
+        tg = self.cfg.setdefault("telegram", {})
+        tg.update(allowed_user_ids=admins, moderator_user_ids=mods,
+                  super_admin_id=sa, default_lang=lang, alerts_enabled=alerts)
+        try:
+            common.save_config(self.cfg)
+        except Exception as e:  # noqa: BLE001
+            logging.exception("webui: save_config")
+            return self._json(h, {"error": "save_failed", "detail": str(e)}, 500)
+        self.bot.apply_roles(tg)
+        self.audit(h.client_address[0], sess["user"],
+                   "роли: админы=%s модераторы=%s super=%s lang=%s alerts=%s"
+                   % (admins, mods, sa, lang, alerts))
+        return self._json(h, {"ok": True, "allowed_user_ids": admins, "moderator_user_ids": mods,
+                              "super_admin_id": sa, "default_lang": lang, "alerts_enabled": alerts})
+
+    # ----------------------------------------------------------------- actions
+    _OPS = {"startgame", "stopgame", "restartgame", "restartsteam", "login",
+            "watchdog", "restartvm", "stopbot", "restarttask", "testalert"}
+    _CONFIRM = {"restartvm", "stopbot", "restarttask"}
+
+    def _api_action(self, h, method, q, sess):
+        b = self._body(h)
+        op = (b.get("op") or "").strip()
+        if op not in self._OPS:
+            return self._json(h, {"error": "bad_op"}, 400)
+        if op in self._CONFIRM and not b.get("confirm"):
+            return self._json(h, {"error": "need_confirm"}, 400)
+        lang = i18n.norm(b.get("lang") or self.cfg.get("telegram", {}).get("default_lang", "ru"))
+        jid = secrets.token_hex(8)
+        job = {"id": jid, "op": op, "done": False, "ok": None, "text": "",
+               "started": time.time(), "finished": None}
+        with self._jobs_lock:
+            self._jobs[jid] = job
+            while len(self._jobs) > 30:
+                self._jobs.pop(next(iter(self._jobs)))
+        ip, user = h.client_address[0], sess["user"]
+        threading.Thread(target=self._run_job, args=(job, b, lang, ip, user),
+                         name="webjob", daemon=True).start()
+        return self._json(h, {"job": jid})
+
+    def _api_job(self, h, method, q, sess):
+        job = self._jobs.get((q.get("id") or [""])[0])
+        if not job:
+            return self._json(h, {"error": "no_job"}, 404)
+        return self._json(h, job)
+
+    def _run_job(self, job, b, lang, ip, user):
+        op = job["op"]
+        try:
+            ok, text = self._do_op(op, b, lang)
+        except Exception as e:  # noqa: BLE001
+            logging.exception("webui: job %s", op)
+            ok, text = False, "ошибка: %s" % e
+        job.update(ok=bool(ok), text=str(text), done=True, finished=time.time())
+        self.audit(ip, user, "%s → %s: %s" % (op, "ok" if ok else "СБОЙ", str(text)[:200]))
+
+    def _do_op(self, op, b, lang):
+        if op == "startgame":
+            return self.bot._tr(lang, gamectl.start_game(self.cfg))
+        if op == "stopgame":
+            return self.bot._tr(lang, gamectl.stop_game(self.cfg))
+        if op == "restartsteam":
+            return self.bot._tr(lang, gamectl.restart_steam(self.cfg))
+        if op == "restartgame":
+            return self.bot._do_restart_and_login(lang)
+        if op == "login":
+            return self.bot._do_login(lang)
+        if op == "watchdog":
+            if not self.wd:
+                return False, "watchdog недоступен"
+            self.wd.set_enabled(bool(b.get("on")))
+            return True, "watchdog " + ("включён" if self.wd.enabled else "выключен")
+        if op == "restartvm":
+            self.bot.push_alert(i18n.t(self.bot._default_lang, "wait.vm"))
+            ok, msg = gamectl.restart_vm()
+            return ok, ("VM перезагружается" if ok else "не удалось: %s" % msg)
+        if op == "stopbot":
+            task = self.cfg.get("task_name", "SigmaSteamBot")
+            ok, msg = gamectl.disable_bot_task(task)
+            txt = ("задача %s отключена — супервизор останавливается; поднять обратно только с VM"
+                   % task) if ok else ("процесс останавливаю, но задачу %s не отключить: %s" % (task, msg))
+            threading.Timer(1.5, self._shutdown_supervisor).start()
+            return ok, txt
+        if op == "restarttask":
+            self._detached_task_restart(self.cfg.get("task_name", "SigmaSteamBot"))
+            return True, "задача перезапускается — панель оборвётся на ~10 секунд, обновите страницу"
+        if op == "testalert":
+            self.bot.push_alert("🔔 Тест-алерт из веб-панели • %s" % _now_iso())
+            return True, "тест-алерт поставлен в очередь отправки администраторам"
+        return False, "неизвестная операция"
+
+    def _shutdown_supervisor(self):
+        logging.info("webui: /stopbot — останавливаю watchdog и бота")
+        try:
+            if self.wd:
+                self.wd.stop()
+        except Exception:  # noqa: BLE001
+            logging.exception("webui: stop watchdog")
+        try:
+            self.bot.stop()
+        except Exception:  # noqa: BLE001
+            logging.exception("webui: stop bot")
+
+    def _detached_task_restart(self, task):
+        flags = (getattr(subprocess, "DETACHED_PROCESS", 0x8)
+                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200))
+        cmd = ('timeout /t 2 /nobreak >nul & schtasks /End /TN "%s" & '
+               'timeout /t 3 /nobreak >nul & schtasks /Change /TN "%s" /ENABLE & '
+               'schtasks /Run /TN "%s"') % (task, task, task)
+        logging.info("webui: перезапуск задачи %s отдельным процессом", task)
+        subprocess.Popen(["cmd", "/c", cmd], creationflags=flags, close_fds=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+
+
+# --------------------------------------------------------------------------- SPA
+PAGE = r"""<!doctype html>
+<html lang="ru" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SigmaSteamBot</title>
+<style>
+:root{
+  --bg:#0f1216; --panel:#171c22; --panel2:#1e252d; --line:#2b333d; --fg:#e7ecf1;
+  --mut:#93a1b0; --acc:#4c8dff; --ok:#3fb950; --warn:#d29922; --err:#f85149;
+  --radius:10px;
+}
+:root[data-theme="light"]{
+  --bg:#f4f6f8; --panel:#ffffff; --panel2:#eef1f4; --line:#d7dde3; --fg:#1b2229;
+  --mut:#5b6670; --acc:#1f6feb; --ok:#1a7f37; --warn:#9a6700; --err:#cf222e;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,Segoe UI,Roboto,sans-serif}
+a{color:var(--acc)}
+header{display:flex;align-items:center;gap:12px;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5;flex-wrap:wrap}
+header h1{font-size:16px;margin:0;font-weight:650;letter-spacing:.2px}
+header .sp{flex:1}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--mut);display:inline-block;margin-right:6px}
+.dot.ok{background:var(--ok)} .dot.err{background:var(--err)}
+button,.btn{font:inherit;color:var(--fg);background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 12px;cursor:pointer}
+button:hover{border-color:var(--acc)}
+button:disabled{opacity:.5;cursor:not-allowed}
+button.pri{background:var(--acc);border-color:var(--acc);color:#fff}
+button.danger{border-color:var(--err);color:var(--err)}
+button.small{padding:4px 9px;font-size:12.5px}
+nav{display:flex;gap:4px;padding:8px 16px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+nav button{background:transparent;border:0;border-bottom:2px solid transparent;border-radius:0;padding:6px 10px;color:var(--mut)}
+nav button.active{color:var(--fg);border-bottom-color:var(--acc)}
+main{padding:16px;max-width:1100px;margin:0 auto}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px}
+.card h3{margin:0 0 10px;font-size:12.5px;text-transform:uppercase;letter-spacing:.6px;color:var(--mut)}
+.kv{display:flex;justify-content:space-between;gap:10px;padding:3px 0;border-bottom:1px dashed var(--line)}
+.kv:last-child{border-bottom:0}
+.kv b{font-weight:600}
+.pill{display:inline-block;padding:1px 8px;border-radius:20px;font-size:12px;border:1px solid var(--line)}
+.pill.ok{color:var(--ok);border-color:var(--ok)} .pill.err{color:var(--err);border-color:var(--err)}
+.pill.warn{color:var(--warn);border-color:var(--warn)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.actions{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
+.actions button{padding:12px}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);font-size:13px}
+th{color:var(--mut);font-weight:600}
+tr.hl td{background:rgba(76,141,255,.10)}
+pre.log{background:#0b0e12;border:1px solid var(--line);border-radius:8px;padding:10px;max-height:60vh;overflow:auto;font:12px/1.4 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-word}
+:root[data-theme="light"] pre.log{background:#0b0e12;color:#e7ecf1}
+.lg-INFO{color:#9aa7b3} .lg-WARNING{color:var(--warn)} .lg-ERROR,.lg-CRITICAL{color:var(--err)}
+.lg-t{color:#5f6b78}
+input,select,textarea{font:inherit;color:var(--fg);background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px}
+textarea{width:100%;min-height:70px;resize:vertical;font:12.5px/1.4 ui-monospace,Consolas,monospace}
+label.fld{display:block;margin:10px 0}
+label.fld span{display:block;color:var(--mut);font-size:12.5px;margin-bottom:4px}
+.center{min-height:70vh;display:flex;align-items:center;justify-content:center}
+.box{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:22px;width:340px;max-width:92vw}
+.box h2{margin:0 0 4px} .box p.mut{color:var(--mut);margin:.2em 0 1em}
+.msg{margin:10px 0;padding:9px 11px;border-radius:8px;border:1px solid var(--line);font-size:13px;white-space:pre-wrap}
+.msg.ok{border-color:var(--ok);color:var(--ok)} .msg.err{border-color:var(--err);color:var(--err)}
+.msg.info{border-color:var(--acc)}
+.shot{width:100%;border:1px solid var(--line);border-radius:8px;background:#000;min-height:120px;object-fit:contain}
+.thumbs{display:grid;gap:10px;grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
+.thumbs figure{margin:0}
+.thumbs img{width:100%;border:1px solid var(--line);border-radius:6px;cursor:zoom-in}
+.thumbs figcaption{color:var(--mut);font-size:11.5px;margin-top:3px}
+.muted{color:var(--mut)} .mono{font-family:ui-monospace,Consolas,monospace}
+.hide{display:none!important}
+@media(max-width:560px){main{padding:10px}}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+"use strict";
+var S = { authed:false, csrf:"", user:"", must_change:false, lang:localStorage.getItem("sw_lang")||"ru",
+          tab:localStorage.getItem("sw_tab")||"dash", conn:null };
+var T = {
+ ru:{ title:"SigmaSteamBot", logout:"Выход", login:"Войти", user:"Пользователь", pass:"Пароль",
+  dash:"Дашборд", act:"Действия", srv:"Серверы", roles:"Роли", logs:"Логи",
+  refresh:"Обновить", live:"Живой опрос", auto:"Авто",
+  vm:"VM", steam:"Steam", game:"Игра", wd:"Watchdog", internals:"Внутренности бота", monitor:"Монитор сервера",
+  uptime:"Аптайм", cpu:"CPU", ram:"RAM", disk:"Диск C:", session:"Сессия",
+  running:"работает", stopped:"не запущен", account:"аккаунт", signedin:"вход в аккаунт",
+  yes:"да", no:"нет", unknown:"?", pid:"PID", window:"Окно", loginstate:"Состояние входа",
+  ls_done:"в игре", ls_running:"вход выполняется…", ls_idle:"в меню",
+  restarts:"перезапусков (игра/Steam)", lastrestart:"последний перезапуск",
+  threads:"потоков", outbox:"очередь отправки", lastpoll:"посл. опрос Telegram", snapage:"возраст снапшота",
+  present:"в списке", misses:"промахов", console:"консоль активна", rdp:"RDP подключён", nosess:"нет сессии",
+  screenshot:"Скриншот экрана VM",
+  a_startgame:"Запустить игру", a_stopgame:"Остановить игру", a_restartgame:"Перезапуск игры + вход",
+  a_restartsteam:"Перезапуск Steam", a_login:"Войти в игру", a_wd_on:"Watchdog включить",
+  a_wd_off:"Watchdog выключить", a_restartvm:"Перезагрузить VM", a_stopbot:"Остановить бота",
+  a_restarttask:"Перезапустить задачу бота", a_testalert:"Тест-алерт в Telegram",
+  confirm:"Подтвердите действие", cancel:"Отмена", ok:"OK", working:"выполняется…",
+  srv_head:"Публичные серверы (Steam-лобби)", srv_none:"Серверов сейчас нет", srv_src:"источник",
+  col_name:"Сервер", col_players:"Игроки", col_map:"Мир", col_ver:"Версия", col_addr:"Адрес", col_mem:"В лобби",
+  roles_admins:"Администраторы (Telegram ID)", roles_mods:"Модераторы (Telegram ID)",
+  roles_super:"Главный админ (super_admin_id)", roles_lang:"Язык бота по умолчанию",
+  roles_alerts:"Алерты в Telegram включены", roles_hint:"ID через запятую/пробел/с новой строки. ID из обоих списков считается администратором. Нужен ≥1 админ. Главный админ должен быть среди администраторов.",
+  save:"Сохранить", saved:"Сохранено, роли применены на лету",
+  log_sup:"Супервизор", log_audit:"Аудит панели", log_nav:"Вход в игру (скрины)",
+  level:"Уровень", lines:"строк", download:"Скачать", navshots_none:"Скринов последовательности входа нет",
+  chpass_title:"Смена пароля", chpass_note:"Вход по умолчанию admin/admin. Смените пароль сейчас — минимум 6 символов, не «admin».",
+  chpass_old:"Текущий пароль", chpass_new:"Новый пароль", chpass_rep:"Повторите новый пароль",
+  chpass_mismatch:"Пароли не совпадают", change:"Сменить пароль",
+  err_bad_credentials:"Неверный логин или пароль", err_throttled:"Слишком много попыток, подождите",
+  err_bad_old:"Текущий пароль неверный", err_too_short:"Минимум 6 символов", err_too_weak:"Слишком простой пароль",
+  err_auth:"Сессия истекла — войдите заново", err_net:"Нет связи с сервером",
+  ago:"назад", never:"нет данных", n_a:"н/д" },
+ en:{ title:"SigmaSteamBot", logout:"Log out", login:"Log in", user:"Username", pass:"Password",
+  dash:"Dashboard", act:"Actions", srv:"Servers", roles:"Roles", logs:"Logs",
+  refresh:"Refresh", live:"Live poll", auto:"Auto",
+  vm:"VM", steam:"Steam", game:"Game", wd:"Watchdog", internals:"Bot internals", monitor:"Server monitor",
+  uptime:"Uptime", cpu:"CPU", ram:"RAM", disk:"Disk C:", session:"Session",
+  running:"running", stopped:"not running", account:"account", signedin:"signed in",
+  yes:"yes", no:"no", unknown:"?", pid:"PID", window:"Window", loginstate:"Login state",
+  ls_done:"in game", ls_running:"logging in…", ls_idle:"at menu",
+  restarts:"restarts (game/Steam)", lastrestart:"last restart",
+  threads:"threads", outbox:"send queue", lastpoll:"last Telegram poll", snapage:"snapshot age",
+  present:"in list", misses:"misses", console:"console active", rdp:"RDP connected", nosess:"no session",
+  screenshot:"VM screen screenshot",
+  a_startgame:"Start game", a_stopgame:"Stop game", a_restartgame:"Restart game + log in",
+  a_restartsteam:"Restart Steam", a_login:"Log into game", a_wd_on:"Enable watchdog",
+  a_wd_off:"Disable watchdog", a_restartvm:"Reboot VM", a_stopbot:"Stop bot",
+  a_restarttask:"Restart bot task", a_testalert:"Test alert to Telegram",
+  confirm:"Confirm action", cancel:"Cancel", ok:"OK", working:"working…",
+  srv_head:"Public servers (Steam lobbies)", srv_none:"No servers right now", srv_src:"source",
+  col_name:"Server", col_players:"Players", col_map:"World", col_ver:"Version", col_addr:"Address", col_mem:"In lobby",
+  roles_admins:"Administrators (Telegram IDs)", roles_mods:"Moderators (Telegram IDs)",
+  roles_super:"Super admin (super_admin_id)", roles_lang:"Default bot language",
+  roles_alerts:"Telegram alerts enabled", roles_hint:"IDs separated by comma / space / newline. An ID in both lists counts as admin. At least one admin required. Super admin must be one of the admins.",
+  save:"Save", saved:"Saved, roles applied live",
+  log_sup:"Supervisor", log_audit:"Panel audit", log_nav:"In-game login (shots)",
+  level:"Level", lines:"lines", download:"Download", navshots_none:"No login-sequence screenshots",
+  chpass_title:"Change password", chpass_note:"Default login is admin/admin. Change it now — at least 6 characters, not \"admin\".",
+  chpass_old:"Current password", chpass_new:"New password", chpass_rep:"Repeat new password",
+  chpass_mismatch:"Passwords do not match", change:"Change password",
+  err_bad_credentials:"Wrong username or password", err_throttled:"Too many attempts, wait a bit",
+  err_bad_old:"Current password is wrong", err_too_short:"At least 6 characters", err_too_weak:"Password too weak",
+  err_auth:"Session expired — log in again", err_net:"No connection to server",
+  ago:"ago", never:"no data", n_a:"n/a" }
+};
+function t(k){ return (T[S.lang]&&T[S.lang][k]) || (T.ru[k]) || k; }
+var $=function(s,r){return (r||document).querySelector(s)};
+function el(tag,attrs,kids){ var e=document.createElement(tag); attrs=attrs||{};
+  for(var k in attrs){ if(k==="class")e.className=attrs[k]; else if(k==="html")e.innerHTML=attrs[k];
+    else if(k.slice(0,2)==="on")e.addEventListener(k.slice(2),attrs[k]); else if(attrs[k]!=null)e.setAttribute(k,attrs[k]); }
+  (kids||[]).forEach(function(c){ if(c==null)return; e.appendChild(typeof c==="string"?document.createTextNode(c):c); });
+  return e; }
+
+// ---- api ----
+function api(path, opts){
+  opts=opts||{}; opts.headers=opts.headers||{};
+  if(opts.body!=null){ opts.headers["Content-Type"]="application/json"; opts.method=opts.method||"POST"; opts.body=JSON.stringify(opts.body); }
+  if((opts.method||"GET")!=="GET") opts.headers["X-CSRF-Token"]=S.csrf;
+  return fetch(path,opts).then(function(r){
+    setConn(true);
+    if(r.status===401){ S.authed=false; render(); throw {err:"auth"}; }
+    var ct=r.headers.get("Content-Type")||"";
+    if(ct.indexOf("application/json")<0) return r;
+    return r.json().then(function(j){ if(!r.ok) throw j; return j; });
+  }).catch(function(e){ if(e&&e.err==="auth") throw e; if(e instanceof TypeError){ setConn(false); throw {err:"net"}; } throw e; });
+}
+function setConn(ok){ S.conn=ok; var d=$("#conn"); if(d) d.className="dot "+(ok?"ok":"err"); }
+function errText(e){ if(!e) return t("err_net"); if(e.err==="net") return t("err_net");
+  var k="err_"+(e.error||e.err||""); return T[S.lang][k]||e.detail||e.error||t("err_net"); }
+
+// ---- helpers ----
+function fdur(s){ if(s==null) return t("n_a"); s=Math.floor(s); var d=Math.floor(s/86400);s%=86400;
+  var h=Math.floor(s/3600);s%=3600; var m=Math.floor(s/60); s%=60;
+  if(d) return d+"d "+h+"h "+m+"m"; if(h) return h+"h "+m+"m"; if(m) return m+"m "+s+"s"; return s+"s"; }
+function fbytes(n){ if(n==null) return t("n_a"); var u=["B","KB","MB","GB","TB"],i=0; n=+n;
+  while(n>=1024&&i<u.length-1){n/=1024;i++;} return (i?n.toFixed(1):n.toFixed(0))+" "+u[i]; }
+function fago(s){ return s==null? t("never") : fdur(s)+" "+t("ago"); }
+function pill(ok,txt,warn){ return el("span",{class:"pill "+(ok?"ok":(warn?"warn":"err"))},[txt]); }
+
+// ---- shell ----
+function render(){
+  clearInterval(dashTimer); clearInterval(logTimer);
+  var app=$("#app"); app.innerHTML="";
+  if(!S.authed){ app.appendChild(viewLogin()); return; }
+  if(S.must_change){ app.appendChild(viewChpass()); return; }
+  app.appendChild(shell());
+  routeTab();
+}
+function header(){
+  var langBtn=el("button",{class:"small",onclick:function(){ S.lang=S.lang==="ru"?"en":"ru"; localStorage.setItem("sw_lang",S.lang); render(); }},[S.lang==="ru"?"EN":"RU"]);
+  var thBtn=el("button",{class:"small",title:"theme",onclick:toggleTheme},["◐"]);
+  var out=[ el("span",{id:"conn",class:"dot "+(S.conn===false?"err":(S.conn?"ok":""))}),
+            el("h1",{},[t("title")]), el("span",{class:"sp"}),
+            el("span",{class:"muted small"},[S.user||""]), langBtn, thBtn,
+            el("button",{class:"small",onclick:doLogout},[t("logout")]) ];
+  return el("header",{},out);
+}
+function shell(){
+  var tabs=["dash","act","srv","roles","logs"];
+  var nav=el("nav",{}, tabs.map(function(id){
+    return el("button",{class:S.tab===id?"active":"",onclick:function(){ S.tab=id; localStorage.setItem("sw_tab",id); render(); }},[t(id)]);
+  }));
+  return el("div",{},[ header(), nav, el("main",{id:"view"},[]) ]);
+}
+function routeTab(){ var v=$("#view"); v.innerHTML="";
+  ({dash:tabDash,act:tabAct,srv:tabSrv,roles:tabRoles,logs:tabLogs}[S.tab]||tabDash)(v); }
+function toggleTheme(){ var r=document.documentElement; var cur=r.getAttribute("data-theme")==="light"?"dark":"light";
+  r.setAttribute("data-theme",cur); localStorage.setItem("sw_theme",cur); }
+
+// ---- login ----
+function viewLogin(){
+  var box=el("div",{class:"box"},[
+    el("h2",{},[t("login")]), el("p",{class:"mut"},["SigmaSteamBot"]),
+    el("label",{class:"fld"},[el("span",{},[t("user")]), el("input",{id:"lu",autocomplete:"username",value:"admin"})]),
+    el("label",{class:"fld"},[el("span",{},[t("pass")]), el("input",{id:"lp",type:"password",autocomplete:"current-password"})]),
+    el("div",{id:"lmsg"}),
+    el("button",{class:"pri",style:"width:100%;margin-top:6px",onclick:doLogin},[t("login")])
+  ]);
+  box.addEventListener("keydown",function(e){ if(e.key==="Enter") doLogin(); });
+  return el("div",{class:"center"},[box]);
+}
+function doLogin(){
+  var u=$("#lu").value.trim(), p=$("#lp").value;
+  api("/api/login",{body:{username:u,password:p}}).then(function(j){
+    S.authed=true; S.user=j.username; S.csrf=j.csrf; S.must_change=!!j.must_change; render();
+  }).catch(function(e){ var m=$("#lmsg"); if(m) m.innerHTML=""; if(m) m.appendChild(el("div",{class:"msg err"},[errText(e)])); });
+}
+function doLogout(){ api("/api/logout",{method:"POST"}).finally(function(){ S.authed=false; S.csrf=""; render(); }); }
+
+// ---- change password ----
+function viewChpass(){
+  var box=el("div",{class:"box"},[
+    el("h2",{},[t("chpass_title")]),
+    el("p",{class:"mut"},[t("chpass_note")]),
+    el("label",{class:"fld"},[el("span",{},[t("chpass_old")]), el("input",{id:"po",type:"password",value:"admin"})]),
+    el("label",{class:"fld"},[el("span",{},[t("chpass_new")]), el("input",{id:"pn",type:"password"})]),
+    el("label",{class:"fld"},[el("span",{},[t("chpass_rep")]), el("input",{id:"pr",type:"password"})]),
+    el("div",{id:"pmsg"}),
+    el("button",{class:"pri",style:"width:100%",onclick:doChpass},[t("change")]),
+    el("div",{style:"text-align:center;margin-top:10px"},[el("a",{href:"#",onclick:function(e){e.preventDefault();doLogout();}},[t("logout")])])
+  ]);
+  return el("div",{class:"center"},[box]);
+}
+function doChpass(){
+  var o=$("#po").value,n=$("#pn").value,r=$("#pr").value,m=$("#pmsg"); m.innerHTML="";
+  if(n!==r){ m.appendChild(el("div",{class:"msg err"},[t("chpass_mismatch")])); return; }
+  api("/api/password",{body:{old:o,new:n}}).then(function(){
+    S.must_change=false; m.appendChild(el("div",{class:"msg ok"},["OK"])); setTimeout(render,500);
+  }).catch(function(e){ m.appendChild(el("div",{class:"msg err"},[errText(e)])); });
+}
+
+// ---- dashboard ----
+var dashTimer=null;
+function tabDash(v){
+  var wrap=el("div",{},[
+    el("div",{class:"row",style:"margin-bottom:12px"},[
+      el("button",{class:"small",onclick:function(){ loadState(true); }},[t("refresh")+" ("+t("live")+")"]),
+      el("label",{class:"small"},[el("input",{type:"checkbox",id:"dauto",checked:"checked"})," "+t("auto")])
+    ]),
+    el("div",{id:"cards",class:"grid"},[]),
+    el("div",{class:"card",style:"margin-top:12px"},[
+      el("h3",{},[t("screenshot")]),
+      el("div",{class:"row",style:"margin-bottom:8px"},[
+        el("button",{class:"small",onclick:refreshShot},[t("refresh")]),
+        el("label",{class:"small"},[el("input",{type:"checkbox",id:"sauto"})," "+t("auto")+" 20s"])
+      ]),
+      el("img",{class:"shot",id:"shot",alt:"screenshot"}),
+      el("div",{id:"shoterr",class:"muted small"},[])
+    ])
+  ]);
+  v.appendChild(wrap);
+  loadState(false); refreshShot();
+  clearInterval(dashTimer);
+  dashTimer=setInterval(function(){
+    if(document.hidden||S.tab!=="dash"){ return; }
+    if($("#dauto")&&$("#dauto").checked) loadState(false);
+    if($("#sauto")&&$("#sauto").checked) refreshShot();
+  },5000);
+}
+function loadState(live){
+  api("/api/state"+(live?"?live=1":"")).then(function(j){ drawCards(j); }).catch(function(){});
+}
+function drawCards(j){
+  var c=$("#cards"); if(!c) return; c.innerHTML="";
+  var s=j.snapshot||{}, g=s.game||{}, st=s.steam||{}, ic=j.internals||{}, mon=ic.monitor||{};
+  function card(title,rows){ return el("div",{class:"card"},[el("h3",{},[title])].concat(rows.map(function(r){
+    return el("div",{class:"kv"},[el("span",{},[r[0]]), (typeof r[1]==="string"?el("b",{},[r[1]]):r[1])]); }))); }
+  var sess = s.rdp_connected? t("rdp") : (s.console_active? t("console") : t("nosess"));
+  c.appendChild(card(t("vm"),[
+    [t("uptime"), fdur(s.uptime_seconds)],
+    [t("cpu"), (s.cpu_percent!=null?Math.round(s.cpu_percent):"?")+"%  ("+(s.cpu_count||"?")+")"],
+    [t("ram"), (s.mem?Math.round(s.mem.percent)+"%  "+fbytes(s.mem.used)+" / "+fbytes(s.mem.total):"?")],
+    [t("disk"), (s.disk_c?fbytes(s.disk_c.free)+" free ("+Math.round(s.disk_c.percent)+"%)":"?")],
+    [t("session"), sess],
+    [j.live?"live":(t("snapage")), j.live? pill(true,"live") : fago(ic.snapshot_age)]
+  ]));
+  c.appendChild(card(t("steam"),[
+    ["", st.running? pill(true,t("running")) : pill(false,t("stopped"))],
+    [t("account"), st.account||"?"],
+    [t("signedin"), st.logged_in===true? t("yes") : (st.logged_in===false? t("no") : t("unknown"))]
+  ]));
+  var lsMap={done:t("ls_done"),running:t("ls_running"),idle:t("ls_idle")};
+  var grows=[["", g.running? pill(true,t("running")) : pill(false,t("stopped"))]];
+  if(g.running){
+    grows.push([t("loginstate"), lsMap[j.login_state]||t("unknown")]);
+    grows.push([t("pid"), String(g.pid||"?")+"  "+fdur(g.run_seconds)]);
+    grows.push([t("ram")+" / "+t("cpu"), fbytes(g.rss)+"  "+(g.cpu!=null?Math.round(g.cpu):0)+"%"]);
+    if(g.window_title) grows.push([t("window"), g.window_title]);
+  }
+  c.appendChild(card(t("game"),grows));
+  var cn=(s.counters||{});
+  c.appendChild(card(t("wd"),[
+    ["", j.watchdog_enabled? pill(true,"on") : pill(false,"off",true)],
+    [t("restarts"), (cn.game_restarts||0)+" / "+(cn.steam_restarts||0)],
+    [t("lastrestart"), cn.last_restart_ts? new Date(cn.last_restart_ts*1000).toLocaleString() : "—"]
+  ]));
+  c.appendChild(card(t("internals"),[
+    [t("uptime"), fdur(ic.proc_uptime)],
+    [t("threads"), String(ic.threads||"?")],
+    [t("outbox"), String(ic.outbox||0)],
+    [t("lastpoll"), fago(ic.last_poll_ok_age)]
+  ]));
+  c.appendChild(card(t("monitor"),[
+    ["", (mon.name||"?")],
+    [t("present"), mon.present===true? pill(true,t("yes")) : (mon.present===false? pill(false,t("no"),true) : t("unknown"))],
+    [t("misses"), String(mon.misses||0)+(mon.alerted?"  ⚠":"")]
+  ]));
+}
+function refreshShot(){
+  var img=$("#shot"); if(!img) return; var e=$("#shoterr"); if(e) e.textContent="";
+  var url="/api/shot?_="+Date.now();
+  fetch(url).then(function(r){
+    if(r.ok) return r.blob().then(function(b){ img.src=URL.createObjectURL(b);
+      var m=r.headers.get("X-Shot-Method"); if(e) e.textContent=(m||"")+" "+(r.headers.get("X-Shot-Size")||""); });
+    return r.json().then(function(j){ if(e) e.textContent="⚠ "+(j.detail||j.error||"capture failed"); });
+  }).catch(function(){ if(e) e.textContent=t("err_net"); });
+}
+
+// ---- actions ----
+function tabAct(v){
+  var defs=[
+    ["startgame","a_startgame",0], ["stopgame","a_stopgame",0],
+    ["restartgame","a_restartgame",0], ["restartsteam","a_restartsteam",0],
+    ["login","a_login",0], ["watchdog","a_wd_on",0,{on:true}], ["watchdog","a_wd_off",0,{on:false}],
+    ["testalert","a_testalert",0],
+    ["restartvm","a_restartvm",1], ["restarttask","a_restarttask",1], ["stopbot","a_stopbot",1]
+  ];
+  var grid=el("div",{class:"actions"}, defs.map(function(d){
+    var cls=d[2]?"danger":""; if(d[0]==="restartgame"||d[0]==="login") cls="pri";
+    return el("button",{class:cls,onclick:function(){ runAction(d[0], d[3]||{}, d[2], t(d[1])); }},[t(d[1])]);
+  }));
+  var out=el("div",{id:"actout"},[]);
+  v.appendChild(el("div",{},[grid, out]));
+}
+function runAction(op, extra, needConfirm, label){
+  if(needConfirm && !window.confirm(t("confirm")+":\n"+label)) return;
+  var body=Object.assign({op:op, lang:S.lang, confirm:needConfirm?true:undefined}, extra);
+  var out=$("#actout"); out.innerHTML="";
+  var m=el("div",{class:"msg info"},[label+" — "+t("working")]); out.appendChild(m);
+  api("/api/action",{body:body}).then(function(j){ pollJob(j.job, m); })
+    .catch(function(e){ m.className="msg err"; m.textContent=errText(e); });
+}
+function pollJob(id,m){
+  var iv=setInterval(function(){
+    api("/api/job?id="+id).then(function(j){
+      if(!j.done){ return; }
+      clearInterval(iv);
+      m.className="msg "+(j.ok?"ok":"err");
+      m.textContent=(j.ok?"✅ ":"🔴 ")+j.text;
+      if(S.tab==="dash") loadState(false);
+    }).catch(function(){ clearInterval(iv); m.className="msg err"; m.textContent=t("err_net"); });
+  },1500);
+}
+
+// ---- servers ----
+function tabSrv(v){
+  var out=el("div",{id:"srvout"},[el("p",{class:"muted"},["…"])]);
+  v.appendChild(el("div",{},[ el("div",{class:"row",style:"margin-bottom:10px"},[
+    el("button",{class:"small",onclick:loadSrv},[t("refresh")]) ]), out ]));
+  loadSrv();
+}
+function loadSrv(){
+  api("/api/servers").then(function(j){
+    var out=$("#srvout"); out.innerHTML="";
+    if(!j.ok){ out.appendChild(el("div",{class:"msg err"},[j.error||"error"])); return; }
+    if(!j.servers.length){ out.appendChild(el("p",{class:"muted"},[t("srv_none")])); return; }
+    var rows=j.servers.slice().sort(function(a,b){
+      var ah=/astralsigma/.test((a.name||"").toLowerCase().replace(/ /g,""));
+      var bh=/astralsigma/.test((b.name||"").toLowerCase().replace(/ /g,""));
+      if(ah!==bh) return ah?-1:1; return (b.players||0)-(a.players||0);
+    });
+    var tb=el("table",{},[ el("tr",{},[t("col_name"),t("col_players"),t("col_map"),t("col_ver"),t("col_addr"),t("col_mem")].map(function(x){return el("th",{},[x]);})) ]);
+    rows.forEach(function(s){
+      var hl=/astralsigma/.test((s.name||"").toLowerCase().replace(/ /g,""));
+      tb.appendChild(el("tr",{class:hl?"hl":""},[
+        el("td",{},[(hl?"👑 ":"")+(s.name||"?")]),
+        el("td",{},[(s.players||0)+" / "+(s.max_players||0)]),
+        el("td",{},[s.map||"—"]), el("td",{},[s.version?("v"+s.version):"—"]),
+        el("td",{class:"mono"},[s.addr||"—"]), el("td",{},[s.members!=null?String(s.members):"—"])
+      ]));
+    });
+    out.appendChild(tb);
+    out.appendChild(el("p",{class:"muted small",style:"margin-top:8px"},[
+      j.servers.length+" • "+t("srv_src")+": "+j.source+" • "+t("auto")+" "+j.cached_age+"s"]));
+  }).catch(function(e){ var o=$("#srvout"); if(o){o.innerHTML="";o.appendChild(el("div",{class:"msg err"},[errText(e)]));} });
+}
+
+// ---- roles ----
+function tabRoles(v){
+  var out=el("div",{id:"rout"},[el("p",{class:"muted"},["…"])]);
+  v.appendChild(out);
+  api("/api/roles").then(function(j){ drawRoles(out,j); })
+    .catch(function(e){ out.innerHTML=""; out.appendChild(el("div",{class:"msg err"},[errText(e)])); });
+}
+function drawRoles(out,j){
+  out.innerHTML="";
+  var fAdm=el("textarea",{id:"radm"},[ (j.allowed_user_ids||[]).join(", ") ]);
+  var fMod=el("textarea",{id:"rmod"},[ (j.moderator_user_ids||[]).join(", ") ]);
+  var fSup=el("input",{id:"rsup",value:j.super_admin_id!=null?j.super_admin_id:"",style:"width:220px"});
+  var fLang=el("select",{id:"rlang"}, ["ru","en"].map(function(l){ return el("option",{value:l,selected:j.default_lang===l?"selected":null},[l]); }));
+  var fAlerts=el("input",{id:"ralerts",type:"checkbox"}); if(j.alerts_enabled) fAlerts.checked=true;
+  var card=el("div",{class:"card"},[
+    el("label",{class:"fld"},[el("span",{},[t("roles_admins")]),fAdm]),
+    el("label",{class:"fld"},[el("span",{},[t("roles_mods")]),fMod]),
+    el("label",{class:"fld"},[el("span",{},[t("roles_super")]),fSup]),
+    el("label",{class:"fld"},[el("span",{},[t("roles_lang")]),fLang]),
+    el("label",{class:"fld"},[el("span",{},[t("roles_alerts")]),fAlerts]),
+    el("p",{class:"muted small"},[t("roles_hint")]),
+    el("div",{id:"rmsg"}),
+    el("button",{class:"pri",onclick:saveRoles},[t("save")])
+  ]);
+  out.appendChild(card);
+}
+function saveRoles(){
+  var m=$("#rmsg"); m.innerHTML="";
+  var body={ allowed_user_ids:$("#radm").value, moderator_user_ids:$("#rmod").value,
+    super_admin_id:$("#rsup").value.trim(), default_lang:$("#rlang").value, alerts_enabled:$("#ralerts").checked };
+  api("/api/roles",{body:body}).then(function(){ m.appendChild(el("div",{class:"msg ok"},[t("saved")])); })
+    .catch(function(e){ m.appendChild(el("div",{class:"msg err"},[errText(e)])); });
+}
+
+// ---- logs ----
+var logTimer=null;
+function tabLogs(v){
+  var sub=localStorage.getItem("sw_logsub")||"sup";
+  var bar=el("nav",{style:"padding:0;border:0;background:transparent;margin-bottom:10px"},
+    [["sup","log_sup"],["audit","log_audit"],["nav","log_nav"]].map(function(x){
+      return el("button",{class:sub===x[0]?"active":"",onclick:function(){ localStorage.setItem("sw_logsub",x[0]); render(); }},[t(x[1])]);
+    }));
+  var body=el("div",{id:"logbody"},[]);
+  v.appendChild(el("div",{},[bar,body]));
+  clearInterval(logTimer);
+  if(sub==="sup") logSup(body);
+  else if(sub==="audit") logAudit(body);
+  else logNav(body);
+}
+function logSup(body){
+  body.innerHTML="";
+  var lvl=el("select",{id:"lglvl"}, ["ALL","INFO","WARNING","ERROR"].map(function(l){return el("option",{value:l},[l]);}));
+  var nSel=el("select",{id:"lgn"}, ["150","300","600","1200"].map(function(l){return el("option",{value:l},[l]);}));
+  nSel.value="300";
+  var pre=el("pre",{class:"log",id:"lgpre"},["…"]);
+  var auto=el("input",{type:"checkbox",id:"lgauto",checked:"checked"});
+  body.appendChild(el("div",{class:"row",style:"margin-bottom:8px"},[
+    el("label",{class:"small"},[t("level")+" ",lvl]),
+    el("label",{class:"small"},[t("lines")+" ",nSel]),
+    el("label",{class:"small"},[auto," "+t("auto")]),
+    el("button",{class:"small",onclick:pullSup},[t("refresh")]),
+    el("button",{class:"small",onclick:function(){ window.open("/api/log?fmt=txt&n=2000","_blank"); }},[t("download")])
+  ]));
+  body.appendChild(pre);
+  lvl.onchange=nSel.onchange=pullSup;
+  pullSup();
+  logTimer=setInterval(function(){ if(!document.hidden && $("#lgauto") && $("#lgauto").checked) pullSup(); },4000);
+}
+function pullSup(){
+  var lvl=($("#lglvl")||{}).value||"ALL", n=($("#lgn")||{}).value||"300";
+  api("/api/log?level="+lvl+"&n="+n).then(function(j){
+    var pre=$("#lgpre"); if(!pre) return; pre.innerHTML="";
+    j.lines.forEach(function(r){
+      pre.appendChild(el("span",{class:"lg-t"},[(r.ts||"").slice(5,19)+" "]));
+      pre.appendChild(el("span",{class:"lg-"+(r.level||"INFO")},[(r.level?r.level[0]:" ")+" "+(r.thread?"["+r.thread+"] ":"")+r.msg+"\n"]));
+    });
+    pre.scrollTop=pre.scrollHeight;
+  }).catch(function(){});
+}
+function logAudit(body){
+  body.innerHTML=""; var tb=el("table",{id:"autb"},[]);
+  body.appendChild(el("div",{class:"row",style:"margin-bottom:8px"},[el("button",{class:"small",onclick:pullAudit},[t("refresh")])]));
+  body.appendChild(tb); pullAudit();
+}
+function pullAudit(){
+  api("/api/audit").then(function(j){
+    var tb=$("#autb"); if(!tb) return; tb.innerHTML="";
+    tb.appendChild(el("tr",{},["ts","IP","user","msg"].map(function(x){return el("th",{},[x]);})));
+    j.lines.slice().reverse().forEach(function(r){
+      tb.appendChild(el("tr",{},[el("td",{class:"mono"},[r.ts]),el("td",{class:"mono"},[r.ip]),el("td",{},[r.user]),el("td",{},[r.msg])]));
+    });
+  }).catch(function(){});
+}
+function logNav(body){
+  body.innerHTML="";
+  api("/api/nav-shots").then(function(j){
+    if(!j.shots.length){ body.appendChild(el("p",{class:"muted"},[t("navshots_none")])); return; }
+    var g=el("div",{class:"thumbs"}, j.shots.map(function(s){
+      return el("figure",{},[
+        el("img",{src:"/api/nav-shot?name="+encodeURIComponent(s.name),onclick:function(e){ window.open(e.target.src,"_blank"); }}),
+        el("figcaption",{},[s.name+" • "+fago(s.age)])
+      ]);
+    }));
+    body.appendChild(g);
+  }).catch(function(e){ body.appendChild(el("div",{class:"msg err"},[errText(e)])); });
+}
+
+// ---- boot ----
+(function(){
+  var th=localStorage.getItem("sw_theme"); if(th) document.documentElement.setAttribute("data-theme",th);
+  document.addEventListener("visibilitychange",function(){ if(!document.hidden && S.authed && !S.must_change){
+    if(S.tab==="dash") loadState(false); } });
+  api("/api/session").then(function(j){
+    S.authed=!!j.authed; S.user=j.username||""; S.csrf=j.csrf||""; S.must_change=!!j.must_change; render();
+  }).catch(function(){ S.authed=false; render(); });
+})();
+</script>
+</body>
+</html>
+"""
