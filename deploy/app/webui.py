@@ -36,6 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import common
 import gamectl
 import i18n
+import players
 import screenshot
 import serverlist
 import sysinfo
@@ -49,6 +50,7 @@ VERSION = "1.0"
 SESSION_TTL = 12 * 3600
 SHOT_MIN_INTERVAL = 4.0
 SERVERS_CACHE_SEC = 45
+PLAYERS_CACHE_SEC = 15
 
 
 def _now_iso():
@@ -258,6 +260,7 @@ class WebUI:
         self._srv = None
         self._thread = None
         self._srv_cache = None  # (ts, payload)
+        self._players_cache = None  # (ts, payload)
         self._shot_lock = threading.Lock()
         self._shot_ts = 0.0
         self._shot_meta = ("", (0, 0))
@@ -496,6 +499,21 @@ class WebUI:
             self._srv_cache = (now, {"ok": ok, "servers": res if ok else [],
                                      "error": None if ok else str(res), "source": src})
         ts, payload = self._srv_cache
+        out = dict(payload)
+        out["cached_age"] = int(now - ts)
+        return self._json(h, out)
+
+    # ---------------------------------------------------------------- players
+    def _api_players(self, h, method, q, sess):
+        now = time.time()
+        if not self._players_cache or now - self._players_cache[0] > PLAYERS_CACHE_SEC:
+            try:
+                payload = players.snapshot(self.cfg)
+            except Exception as e:  # noqa: BLE001
+                logging.exception("webui: players.snapshot")
+                payload = {"ok": False, "error": str(e)}
+            self._players_cache = (now, payload)
+        ts, payload = self._players_cache
         out = dict(payload)
         out["cached_age"] = int(now - ts)
         return self._json(h, out)
@@ -834,7 +852,7 @@ var S = { authed:false, csrf:"", user:"", must_change:false, lang:localStorage.g
           tab:localStorage.getItem("sw_tab")||"dash", conn:null };
 var T = {
  ru:{ title:"SigmaSteamBot", logout:"Выход", login:"Войти", user:"Пользователь", pass:"Пароль",
-  dash:"Дашборд", act:"Действия", srv:"Серверы", roles:"Роли", logs:"Логи",
+  dash:"Дашборд", act:"Действия", srv:"Серверы", players:"Игроки", roles:"Роли", logs:"Логи",
   refresh:"Обновить", live:"Живой опрос", auto:"Авто",
   vm:"VM", steam:"Steam", game:"Игра", wd:"Watchdog", internals:"Внутренности бота", monitor:"Монитор сервера",
   uptime:"Аптайм", cpu:"CPU", ram:"RAM", disk:"Диск C:", session:"Сессия",
@@ -864,9 +882,17 @@ var T = {
   err_bad_credentials:"Неверный логин или пароль", err_throttled:"Слишком много попыток, подождите",
   err_bad_old:"Текущий пароль неверный", err_too_short:"Минимум 6 символов", err_too_weak:"Слишком простой пароль",
   err_auth:"Сессия истекла — войдите заново", err_net:"Нет связи с сервером",
+  pl_head:"Игроки локального сервера", pl_world:"Мир", pl_registered:"зарегистрировано",
+  pl_online:"онлайн (по аналитике)", pl_online_gs:"онлайн (game_state)", pl_bymap:"По картам",
+  pl_only_online:"Только онлайн", pl_search:"поиск по имени",
+  pl_col_status:"Статус", pl_col_enter:"Вход", pl_col_exit:"Выход", pl_col_sess:"Сессия",
+  pl_col_hours:"Часов", pl_col_lvl:"Ур.", pl_col_role:"Роль", pl_col_ban:"Бан",
+  pl_role_player:"игрок", pl_role_staff:"стафф", pl_recent:"Последние события",
+  pl_ev_register:"зарегистрировался", pl_ev_enter:"вошёл", pl_ev_exit:"вышел",
+  pl_none:"Данных о игроках нет", pl_map:"карта",
   ago:"назад", never:"нет данных", n_a:"н/д" },
  en:{ title:"SigmaSteamBot", logout:"Log out", login:"Log in", user:"Username", pass:"Password",
-  dash:"Dashboard", act:"Actions", srv:"Servers", roles:"Roles", logs:"Logs",
+  dash:"Dashboard", act:"Actions", srv:"Servers", players:"Players", roles:"Roles", logs:"Logs",
   refresh:"Refresh", live:"Live poll", auto:"Auto",
   vm:"VM", steam:"Steam", game:"Game", wd:"Watchdog", internals:"Bot internals", monitor:"Server monitor",
   uptime:"Uptime", cpu:"CPU", ram:"RAM", disk:"Disk C:", session:"Session",
@@ -896,6 +922,14 @@ var T = {
   err_bad_credentials:"Wrong username or password", err_throttled:"Too many attempts, wait a bit",
   err_bad_old:"Current password is wrong", err_too_short:"At least 6 characters", err_too_weak:"Password too weak",
   err_auth:"Session expired — log in again", err_net:"No connection to server",
+  pl_head:"Local server players", pl_world:"World", pl_registered:"registered",
+  pl_online:"online (analytics)", pl_online_gs:"online (game_state)", pl_bymap:"By map",
+  pl_only_online:"Online only", pl_search:"search by name",
+  pl_col_status:"Status", pl_col_enter:"Enter", pl_col_exit:"Exit", pl_col_sess:"Session",
+  pl_col_hours:"Hours", pl_col_lvl:"Lvl", pl_col_role:"Role", pl_col_ban:"Ban",
+  pl_role_player:"player", pl_role_staff:"staff", pl_recent:"Recent events",
+  pl_ev_register:"registered", pl_ev_enter:"entered", pl_ev_exit:"left",
+  pl_none:"No player data", pl_map:"map",
   ago:"ago", never:"no data", n_a:"n/a" }
 };
 function t(k){ return (T[S.lang]&&T[S.lang][k]) || (T.ru[k]) || k; }
@@ -934,7 +968,7 @@ function pill(ok,txt,warn){ return el("span",{class:"pill "+(ok?"ok":(warn?"warn
 
 // ---- shell ----
 function render(){
-  clearInterval(dashTimer); clearInterval(logTimer);
+  clearInterval(dashTimer); clearInterval(logTimer); clearInterval(plTimer);
   var app=$("#app"); app.innerHTML="";
   if(!S.authed){ app.appendChild(viewLogin()); return; }
   if(S.must_change){ app.appendChild(viewChpass()); return; }
@@ -951,14 +985,14 @@ function header(){
   return el("header",{},out);
 }
 function shell(){
-  var tabs=["dash","act","srv","roles","logs"];
+  var tabs=["dash","act","srv","players","roles","logs"];
   var nav=el("nav",{}, tabs.map(function(id){
     return el("button",{class:S.tab===id?"active":"",onclick:function(){ S.tab=id; localStorage.setItem("sw_tab",id); render(); }},[t(id)]);
   }));
   return el("div",{},[ header(), nav, el("main",{id:"view"},[]) ]);
 }
 function routeTab(){ var v=$("#view"); v.innerHTML="";
-  ({dash:tabDash,act:tabAct,srv:tabSrv,roles:tabRoles,logs:tabLogs}[S.tab]||tabDash)(v); }
+  ({dash:tabDash,act:tabAct,srv:tabSrv,players:tabPlayers,roles:tabRoles,logs:tabLogs}[S.tab]||tabDash)(v); }
 function toggleTheme(){ var r=document.documentElement; var cur=r.getAttribute("data-theme")==="light"?"dark":"light";
   r.setAttribute("data-theme",cur); localStorage.setItem("sw_theme",cur); }
 
@@ -1159,6 +1193,96 @@ function loadSrv(){
       j.servers.length+" • "+t("srv_src")+": "+j.source+" • "+t("auto")+" "+j.cached_age+"s"]));
   }).catch(function(e){ var o=$("#srvout"); if(o){o.innerHTML="";o.appendChild(el("div",{class:"msg err"},[errText(e)]));} });
 }
+
+// ---- players ----
+var plTimer=null, plData=null;
+function tabPlayers(v){
+  var wrap=el("div",{},[
+    el("div",{class:"row",style:"margin-bottom:10px"},[
+      el("button",{class:"small",onclick:loadPlayers},[t("refresh")]),
+      el("label",{class:"small"},[el("input",{type:"checkbox",id:"plauto",checked:"checked"})," "+t("auto")]),
+      el("input",{id:"plq",placeholder:t("pl_search"),style:"padding:5px 8px",oninput:renderPlayers}),
+      el("label",{class:"small"},[el("input",{type:"checkbox",id:"plon",oninput:renderPlayers})," "+t("pl_only_online")])
+    ]),
+    el("div",{id:"plsum",class:"grid",style:"margin-bottom:12px"},[]),
+    el("div",{id:"plbody"},[el("p",{class:"muted"},["…"])]),
+    el("div",{class:"card",style:"margin-top:12px"},[
+      el("h3",{},[t("pl_recent")]), el("div",{id:"plrecent"},[])
+    ])
+  ]);
+  v.appendChild(wrap);
+  loadPlayers();
+  clearInterval(plTimer);
+  plTimer=setInterval(function(){ if(!document.hidden && S.tab==="players" && $("#plauto") && $("#plauto").checked) loadPlayers(); },15000);
+}
+function loadPlayers(){
+  api("/api/players").then(function(j){ plData=j; renderPlayers(); }).catch(function(e){
+    var b=$("#plbody"); if(b){ b.innerHTML=""; b.appendChild(el("div",{class:"msg err"},[errText(e)])); }
+  });
+}
+function plEvLabel(k){ return t("pl_ev_"+k)||k; }
+function renderPlayers(){
+  var j=plData; if(!j) return;
+  var sum=$("#plsum"), body=$("#plbody"), rec=$("#plrecent");
+  if(!j.ok){ sum.innerHTML=""; body.innerHTML=""; body.appendChild(el("div",{class:"msg err"},[j.error||t("pl_none")]));
+    if(j.root) body.appendChild(el("p",{class:"muted small mono"},[j.root])); rec.innerHTML=""; return; }
+  var tt=j.totals||{};
+  sum.innerHTML="";
+  function card(title,rows){ return el("div",{class:"card"},[el("h3",{},[title])].concat(rows.map(function(r){
+    return el("div",{class:"kv"},[el("span",{},[r[0]]),(typeof r[1]==="string"?el("b",{},[r[1]]):r[1])]); }))); }
+  sum.appendChild(card(t("pl_world"),[
+    ["", j.world||"?"],
+    [t("pl_registered"), String(tt.registered||0)],
+    [t("pl_online"), pill(true,String(tt.online_analytics||0))],
+    [t("pl_online_gs"), String(tt.online_game_state||0)]
+  ]));
+  var bm=(j.by_map||[]);
+  sum.appendChild(card(t("pl_bymap"), bm.length? bm.map(function(m){ return [t("pl_map")+" "+m.map, String(m.count)]; })
+                                              : [["", t("dash")]]));
+
+  var q=(($("#plq")||{}).value||"").toLowerCase().trim();
+  var onlyOn=($("#plon")||{}).checked;
+  var rows=(j.users||[]).filter(function(u){
+    if(onlyOn && !u.online) return false;
+    if(q && (u.name||"").toLowerCase().indexOf(q)<0 && String(u.id).indexOf(q)<0) return false;
+    return true;
+  }).sort(function(a,b){ if(a.online!==b.online) return a.online?-1:1;
+    return (b.last_enter||"").localeCompare(a.last_enter||""); });
+
+  body.innerHTML="";
+  var head=["ID",t("col_name"),t("pl_col_status"),t("pl_col_enter"),t("pl_col_exit"),t("pl_col_sess"),
+            t("pl_col_hours"),t("pl_col_lvl"),t("pl_col_role"),t("pl_col_ban")];
+  var tb=el("table",{},[el("tr",{},head.map(function(x){return el("th",{},[x]);}))]);
+  rows.forEach(function(u){
+    var st = u.online? pill(true,t("running")) : el("span",{class:"muted"},[fshort(u.last_exit)]);
+    var role = (u.role>0)? el("span",{class:"pill warn"},[t("pl_role_staff")+" "+u.role]) : el("span",{class:"muted"},[t("pl_role_player")]);
+    tb.appendChild(el("tr",{class:u.online?"hl":""},[
+      el("td",{class:"mono"},[String(u.id)]),
+      el("td",{},[u.name||"?"]),
+      el("td",{},[st]),
+      el("td",{class:"mono"},[fshort(u.last_enter)]),
+      el("td",{class:"mono"},[fshort(u.last_exit)]),
+      el("td",{},[u.session_secs!=null? fdur(u.session_secs) : "—"]),
+      el("td",{},[u.playtime_h!=null? String(u.playtime_h) : "—"]),
+      el("td",{},[u.level!=null? String(u.level) : "—"]),
+      el("td",{},[role]),
+      el("td",{},[u.banned? el("span",{class:"pill err"},["ban"]) : "—"])
+    ]));
+  });
+  body.appendChild(tb);
+  body.appendChild(el("p",{class:"muted small",style:"margin-top:8px"},[
+    rows.length+" / "+(j.users||[]).length+" • "+t("auto")+" "+ (j.cached_age||0) +"s • "+(j.generated||"")]));
+
+  rec.innerHTML="";
+  var rl=el("div",{class:"mono small"},[]);
+  (j.recent||[]).forEach(function(e){
+    var extra = (e.kind==="exit" && e.secs!=null)? " ("+fdur(e.secs)+")" : "";
+    rl.appendChild(el("div",{},[fshort(e.ts)+"  "+ (e.name||("id "+e.id)) +" — "+plEvLabel(e.kind)+extra]));
+  });
+  rec.appendChild(rl);
+}
+function fshort(ts){ if(!ts) return "—"; var m=ts.match(/^(\d\d?)\.(\d\d?)\.\d{4} (\d\d?:\d\d)/);
+  return m? (m[1].padStart(2,"0")+"."+m[2].padStart(2,"0")+" "+m[3]) : ts; }
 
 // ---- roles ----
 function tabRoles(v){

@@ -11,6 +11,7 @@ except Exception:
 import common
 import gamectl
 import i18n
+import players
 import serverlist
 import serverlist_steam  # noqa: F401  (проверка, что модуль импортируется)
 import sysinfo
@@ -48,6 +49,23 @@ os.remove(_wa_path)
 _wcfg = cfg.get("webui", {}) or {}
 print("webui OK: auth admin/admin+must_change, PBKDF2, host=%s port=%s enabled=%s"
       % (_wcfg.get("host", "0.0.0.0"), _wcfg.get("port", 8080), _wcfg.get("enabled", True)))
+
+# --- вкладка «Игроки»: чтение файлов локального сервера ---
+try:
+    _psnap = players.snapshot(cfg)
+    if _psnap.get("ok"):
+        _pt = _psnap["totals"]
+        # пароли не должны утечь ни в users, ни в recent
+        _blob = str(_psnap["users"]) + str(_psnap["recent"])
+        assert "code" not in _blob.lower() or "'code'" not in _blob, "players: пароль в выдаче!"
+        print("players OK: world=%r registered=%s online(analytics)=%s online(game_state)=%s recent=%d"
+              % (_psnap["world"], _pt["registered"], _pt["online_analytics"],
+                 _pt["online_game_state"], len(_psnap["recent"])))
+    else:
+        print("players: каталог мира не найден — %s (root=%s)"
+              % (_psnap.get("error"), _psnap.get("root")))
+except Exception as _e:  # noqa: BLE001
+    print("players: ОШИБКА", _e)
 
 _mon = cfg.get("monitor", {}) or {}
 print("монитор сервера: enabled=%s name=%r interval=%ss misses=%s repeat=%ss"

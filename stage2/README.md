@@ -28,6 +28,7 @@
 | `watchdog.py` | цикл поддержания игры |
 | `bot.py` | команды и кнопки Telegram, фоновый монитор сервера |
 | `webui.py` | веб-панель: HTTP-поток в супервизоре, аутентификация (`webui_auth.json`), API, встроенный SPA, правка ролей на лету |
+| `players.py` | вкладка «Игроки» веб-панели: список/онлайн игроков локального сервера из `analytics.txt` + `Data\users\*` + `Logs\game_state.txt` (пароли `Code` не отдаются) |
 | `serverlist.py` | `fetch(cfg)` — список серверов: Steam-лобби, при ошибке Web API |
 | `serverlist_steam.py` | перечисление Steam-лобби через `steam_api64.dll` игры (`ctypes`), отдельный процесс |
 | `supervisor.py` | точка входа, single-instance lock |
@@ -127,6 +128,13 @@ Sigma World Online не регистрирует game-серверы в маст
   правится.
 - **Логи** — хвост `supervisor.log` (фильтр по уровню, автообновление, скачивание),
   аудит панели `webui_audit.log` (кто/когда/что), галерея `logs/nav/*.png`.
+- **Игроки** — `players.py`: список и онлайн-статус игроков локального сервера из
+  файлов игры (`...\LocalServer\<мир>\analytics.txt` — журнал
+  `register|enter|exit`, час бывает однозначным; `Data\users\user_list.json` —
+  id→имя; `Data\users\user<N>.json` — часы/уровень/роль/бан; `Logs\game_state.txt`
+  — онлайн по картам). Каталог мира — `config.json → players`
+  (`localserver_root` / `world` / `world_dir`, пусто = автоопределение по свежести
+  `analytics.txt`). Кэш 15 c. **Пароли игроков (`Code`) в выдачу не попадают.**
 
 Двуязычно ru/en (тумблер в шапке), тёмная/светлая тема.
 

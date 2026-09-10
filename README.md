@@ -56,6 +56,7 @@
 | `watchdog.py` | цикл поддержания Steam/игры, авто-вход, алерты |
 | `bot.py` | команды и inline-кнопки Telegram, роли, аудит, фоновый монитор сервера |
 | `webui.py` | веб-панель (HTTP-поток в супервизоре): аутентификация, API, встроенный SPA; правка ролей на лету через `bot.apply_roles` |
+| `players.py` | вкладка «Игроки» веб-панели: список и онлайн-статус игроков локального сервера из файлов игры (`analytics.txt`, `Data\users\*`, `Logs\game_state.txt`); пароли (`Code`) не отдаются |
 | `common.py` | конфиг (`load_config` / `save_config` без BOM), логи, `State` (в `state.json`), клиент Telegram поверх `curl.exe` + SOCKS5 |
 | `i18n.py` | двуязычные строки (`ru`/`en`) + `t()`; паритет ключей проверяет `selftest.py` |
 | `gamectl.py` | старт/стоп/рестарт Steam и игры, перезагрузка VM, отключение задачи бота |
@@ -122,8 +123,22 @@ HTTP-поток внутри супервизора (`webui.py`), слушает
 - **Серверы** — тот же список Steam-лобби (`serverlist.fetch`, кэш 45 c), AstralSigma наверху.
 - **Роли** — правка `telegram.allowed_user_ids` / `moderator_user_ids` / `super_admin_id` / `default_lang` / `alerts_enabled`. Сохранение пишет `config.json` в чистом UTF-8 (`common.save_config`, без BOM) и **применяет роли на лету** (`Bot.apply_roles`) — перезапуск не нужен. Координаты `login_flow` из веба не редактируются намеренно.
 - **Логи** — хвост `supervisor.log` (фильтр по уровню, автообновление, скачивание), аудит панели (`webui_audit.log` — кто/когда/что нажал, отдельно от Telegram-аудита) и галерея скринов последовательности входа (`logs/nav/*.png`).
+- **Игроки** — список и онлайн-статус игроков локального сервера (см. ниже).
 
 Интерфейс двуязычный (ru/en, тумблер в шапке, выбор в `localStorage` браузера), тёмная/светлая тема. Отключить панель целиком — `webui.enabled = false` в `config.json`.
+
+### Игроки локального сервера
+
+Вкладка «Игроки» веб-панели (`players.py`). Читает файлы, которые пишет сам локальный сервер игры, из каталога активного мира под `%USERPROFILE%\AppData\LocalLow\Crematorium of Time\SigmaWorld\SigmaWorld\LocalServer\<мир>\`:
+
+| Файл | Что берётся |
+|---|---|
+| `analytics.txt` | журнал `ДД.ММ.ГГГГ Ч:ММ:СС: register\|enter\|exit <id> [<сек>]` (час бывает однозначным). Онлайн = последнее событие игрока `enter`; `exit` несёт длину сессии в секундах; отсюда же лента последних событий |
+| `Data\users\user_list.json` | `id → имя` (поле `Code` — **пароль игрока, наружу не отдаётся**) |
+| `Data\users\user<N>.json` | профиль: всего часов (`timeGame`), уровень (`unitLevel`), роль (`role`, 0 = игрок), бан (`isBlock`/`timeBan`), карта, клан, страна |
+| `Logs\game_state.txt` | авторитетные счётчики онлайна по картам (без имён) — показываются рядом с оценкой по `analytics.txt` |
+
+Каталог мира — `config.json → players`: `localserver_root` (пусто = путь по умолчанию выше), `world` / `world_dir` (пусто = мир с самым свежим `analytics.txt`). Данные кэшируются в панели на 15 c. Пароли (`code` / `Code`) вырезаются на сервере и в выдачу не попадают. Отключить — `players.enabled = false`.
 
 ### Установка
 
@@ -140,6 +155,7 @@ HTTP-поток внутри супервизора (`webui.py`), слушает
 | `python_exe` | python для дочерних скриптов; пусто → авто (`sys.executable`, `pythonw`→`python`) |
 | `monitor` | `{ enabled, server_name, interval_seconds, misses_before_alert, repeat_alert_seconds }` |
 | `webui` | `{ enabled, host, port }` — веб-панель; `0.0.0.0:8080` по умолчанию. Креды — в `webui_auth.json` (не в конфиге) |
+| `players` | `{ enabled, localserver_root, world, world_dir }` — вкладка «Игроки»; всё пусто = автоопределение каталога мира |
 | `telegram.token` | токен @BotFather |
 | `telegram.allowed_user_ids` / `moderator_user_ids` / `super_admin_id` | роли (правятся и из веб-панели) |
 | `telegram.default_lang` | `ru` \| `en` |
@@ -217,6 +233,7 @@ SigmaConsoleGuard task (SYSTEM, on RDP-disconnect event)
 | `watchdog.py` | Steam/game keep-alive loop, auto-login, alerts |
 | `bot.py` | Telegram commands and inline buttons, roles, audit, background server monitor |
 | `webui.py` | web panel (HTTP thread in the supervisor): authentication, API, embedded SPA; live role editing via `bot.apply_roles` |
+| `players.py` | web panel "Players" tab: local-server player list and online status from the game's own files (`analytics.txt`, `Data\users\*`, `Logs\game_state.txt`); passwords (`Code`) are never exposed |
 | `common.py` | config (`load_config` / `save_config` without BOM), logging, `State` (in `state.json`), Telegram client over `curl.exe` + SOCKS5 |
 | `i18n.py` | bilingual strings (`ru`/`en`) + `t()`; key parity checked by `selftest.py` |
 | `gamectl.py` | start/stop/restart Steam and game, reboot VM, disable the bot task |
@@ -283,8 +300,22 @@ An HTTP thread inside the supervisor (`webui.py`), listening on `webui.host:webu
 - **Servers** — the same Steam-lobby list (`serverlist.fetch`, 45 s cache), AstralSigma pinned to the top.
 - **Roles** — editing `telegram.allowed_user_ids` / `moderator_user_ids` / `super_admin_id` / `default_lang` / `alerts_enabled`. Saving writes `config.json` as plain UTF-8 (`common.save_config`, no BOM) and **applies the roles live** (`Bot.apply_roles`) — no restart needed. `login_flow` coordinates are intentionally not editable from the web.
 - **Logs** — tail of `supervisor.log` (level filter, auto-refresh, download), the panel audit (`webui_audit.log` — who/when/what, separate from the Telegram audit) and a gallery of login-sequence screenshots (`logs/nav/*.png`).
+- **Players** — local-server player list and online status (see below).
 
 The interface is bilingual (ru/en, header toggle, choice in the browser `localStorage`), with a dark/light theme. Disable the panel entirely with `webui.enabled = false` in `config.json`.
+
+### Local server players
+
+The panel's "Players" tab (`players.py`). Reads the files the game's local server writes itself, from the active world folder under `%USERPROFILE%\AppData\LocalLow\Crematorium of Time\SigmaWorld\SigmaWorld\LocalServer\<world>\`:
+
+| File | Used for |
+|---|---|
+| `analytics.txt` | log `DD.MM.YYYY H:MM:SS: register\|enter\|exit <id> [<sec>]` (the hour may be single-digit). Online = the player's last event is `enter`; `exit` carries the session length in seconds; also the recent-events feed |
+| `Data\users\user_list.json` | `id → name` (the `Code` field is the **player's password — never exposed**) |
+| `Data\users\user<N>.json` | profile: total hours (`timeGame`), level (`unitLevel`), role (`role`, 0 = player), ban (`isBlock`/`timeBan`), map, clan, country |
+| `Logs\game_state.txt` | authoritative online counts per map (no names) — shown next to the `analytics.txt` estimate |
+
+The world folder is set via `config.json → players`: `localserver_root` (empty = the default path above), `world` / `world_dir` (empty = the world with the freshest `analytics.txt`). The panel caches this for 15 s. Passwords (`code` / `Code`) are stripped server-side and never reach the client. Disable with `players.enabled = false`.
 
 ### Install
 
@@ -301,6 +332,7 @@ Full guide — [`deploy/README.md`](deploy/README.md). In short: copy `deploy\` 
 | `python_exe` | python for child scripts; empty → auto (`sys.executable`, `pythonw`→`python`) |
 | `monitor` | `{ enabled, server_name, interval_seconds, misses_before_alert, repeat_alert_seconds }` |
 | `webui` | `{ enabled, host, port }` — web panel; `0.0.0.0:8080` by default. Credentials live in `webui_auth.json`, not in the config |
+| `players` | `{ enabled, localserver_root, world, world_dir }` — "Players" tab; all empty = auto-detect the world folder |
 | `telegram.token` | @BotFather token |
 | `telegram.allowed_user_ids` / `moderator_user_ids` / `super_admin_id` | roles (also editable from the web panel) |
 | `telegram.default_lang` | `ru` \| `en` |

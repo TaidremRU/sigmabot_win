@@ -76,6 +76,7 @@ Telegram-бота. Держит Steam и игру запущенными, пос
 | `python_exe` | python для дочерних скриптов; пусто → авто (`sys.executable`, `pythonw`→`python`) |
 | `monitor` | `{ enabled, server_name, interval_seconds, misses_before_alert, repeat_alert_seconds }` — фоновая проверка присутствия сервера в списке Steam-лобби |
 | `webui` | `{ enabled, host, port }` — веб-панель (см. §4a). `0.0.0.0:8080` по умолчанию; правило фаервола на порт ставит `install.ps1`. Креды — в `webui_auth.json` (не в конфиге) |
+| `players` | `{ enabled, localserver_root, world, world_dir }` — вкладка «Игроки» веб-панели. Всё пусто = автоопределение каталога мира по свежести `analytics.txt` |
 | `telegram.token` | токен от @BotFather |
 | `telegram.allowed_user_ids` | `[280331544]` — numeric Telegram ID **администраторов** (полный доступ) |
 | `telegram.moderator_user_ids` | `[]` — ID **модераторов**: только `/status`, `/shot`, `/restartgame`, `/login`, `/lang`. ID, попавший и сюда, и в `allowed_user_ids`, считается админом |
@@ -190,6 +191,7 @@ CSRF-токеном; после 5 неудачных входов IP блоки�
 | Серверы | тот же список Steam-лобби (`serverlist.fetch`, кэш 45 c) |
 | Роли | правка `telegram.allowed_user_ids` / `moderator_user_ids` / `super_admin_id` / `default_lang` / `alerts_enabled`. Пишет `config.json` в чистом UTF-8 (без BOM) и применяет роли **на лету** — перезапуск не нужен. Координаты `login_flow` из веба не редактируются |
 | Логи | хвост `logs\supervisor.log` (фильтр по уровню, автообновление, «Скачать»), аудит панели `webui_audit.log` (кто/когда/что нажал — отдельно от Telegram-аудита), галерея `logs\nav\*.png` (скрины последовательности входа) |
+| Игроки | список и онлайн-статус игроков локального сервера из файлов игры: `...\LocalLow\Crematorium of Time\SigmaWorld\SigmaWorld\LocalServer\<мир>\` — `analytics.txt` (журнал `register\|enter\|exit`), `Data\users\user_list.json` (id→имя), `Data\users\user<N>.json` (часы/уровень/роль/бан), `Logs\game_state.txt` (онлайн по картам). Каталог мира — `config.json → players` (`localserver_root` / `world` / `world_dir`; пусто = мир с самым свежим `analytics.txt`). Кэш 15 c. **Пароли игроков (`Code`) не отдаются** |
 
 Интерфейс двуязычный (ru/en, тумблер в шапке, выбор в `localStorage` браузера),
 тёмная/светлая тема. Отключить панель целиком — `"webui": { "enabled": false }` в
